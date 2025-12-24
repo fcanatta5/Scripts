@@ -1,7 +1,7 @@
 # mpkg
 
-**mpkg** é um gerenciador de pacotes em Python, inspirado no Arch Linux, projetado para trabalhar em conjunto com o **mkpkg-lite**.  
-Ele gerencia **PKGFILEs** (formato similar ao PKGBUILD), resolve dependências, constrói pacotes, instala, remove e mantém um banco de dados local de arquivos instalados — tudo sem depender de um sistema de pacotes global.
+**mpkg** é um gerenciador de pacotes em Python, projetado para trabalhar em conjunto com o **mkpkg-lite**.  
+Ele gerencia **PKGFILEs** , resolve dependências, constrói pacotes, instala, remove e mantém um banco de dados local de arquivos instalados — tudo sem depender de um sistema de pacotes global.
 
 ---
 
@@ -21,9 +21,9 @@ Ele gerencia **PKGFILEs** (formato similar ao PKGBUILD), resolve dependências, 
 - Remoção segura:
   - padrão: remove apenas arquivos novos
   - `--force`: remove também arquivos alterados
-- Remoção inteligente de órfãos
+- Remoção de órfãos
 - Rebuild completo de pacotes instalados
-- Upgrade inteligente por comparação de versões
+- Upgrade por comparação de versões
 - Suporte a múltiplos repositórios Git ou locais
 - Instalação a partir de pacotes binários (`.tar.zst` / `.tar.gz`)
 - Interface CLI com **cores e negrito** (sem TUI)
