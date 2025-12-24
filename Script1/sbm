@@ -1,0 +1,1015 @@
+    #!/usr/bin/env python3
+    import argparse
+    import hashlib
+    import os
+    import platform
+    import shutil
+    import subprocess
+    import sys
+    import tarfile
+    from dataclasses import dataclass, field
+    from pathlib import Path
+    from typing import List, Optional, Dict, Tuple
+
+    # ---------------------------------------------------------------------------
+    # Logging
+    # ---------------------------------------------------------------------------
+
+    LOG_LEVELS = {
+        "ERROR": 40,
+        "WARN": 30,
+        "INFO": 20,
+        "DEBUG": 10,
+    }
+
+    CURRENT_LOG_LEVEL = LOG_LEVELS["INFO"]
+
+
+    def set_log_level_from_verbosity(verbosity: int) -> None:
+        """Ajusta o nível de log com base no número de -v.
+
+        0 (default) -> INFO
+        1 ou mais    -> DEBUG
+        """
+        global CURRENT_LOG_LEVEL
+        if verbosity >= 1:
+            CURRENT_LOG_LEVEL = LOG_LEVELS["DEBUG"]
+        else:
+            CURRENT_LOG_LEVEL = LOG_LEVELS["INFO"]
+
+
+    def log(level: str, msg: str) -> None:
+        if LOG_LEVELS[level] >= CURRENT_LOG_LEVEL:
+            prefix = f"[sbm] {level}: "
+            print(prefix + msg, file=sys.stderr if level in ("ERROR", "WARN") else sys.stdout)
+
+
+    # ---------------------------------------------------------------------------
+    # Constantes e tipos básicos
+    # ---------------------------------------------------------------------------
+
+    SBM_ENV_HOME = "SBM_HOME"
+    SBM_ENV_ROOTFS = "SBM_ROOTFS"
+
+    DEFAULT_REPO_DIR = "repo"
+    DEFAULT_SOURCES_DIR = "sources"
+    DEFAULT_BUILD_DIR = "build"
+    DEFAULT_PKG_DIR = "packages"
+
+
+    class SBMError(Exception):
+        pass
+
+
+    try:
+        import yaml  # type: ignore
+    except ImportError:  # pragma: no cover - ambiente sem PyYAML
+        yaml = None  # type: ignore
+
+
+    @dataclass
+    class SourceInfo:
+        url: str
+        filename: str
+        sha256: str
+
+
+    @dataclass
+    class BuildHooks:
+        pre_configure: str = ""
+        configure: str = ""
+        pre_build: str = ""
+        build: str = ""
+        pre_install: str = ""
+        install: str = ""
+        post_install: str = ""
+
+
+    @dataclass
+    class PackageMeta:
+        # Identificador usado na linha de comando e em depends (pode incluir categoria)
+        pkg_id: str
+        # Nome “curto” do pacote (normalmente o nome do programa)
+        name: str
+        version: str
+        release: int
+        arch: List[str] = field(default_factory=list)
+        depends: List[str] = field(default_factory=list)
+        source: SourceInfo = field(default=None)  # type: ignore
+        hooks: BuildHooks = field(default_factory=BuildHooks)
+        category: Optional[str] = None
+        manifest_path: Optional[Path] = None
+
+        @property
+        def full_name(self) -> str:
+            """Nome lógico do pacote, sem categoria.
+
+            Usado para nome de diretório de build e de arquivo .tar.zst.
+            """
+            return f"{self.name}-{self.version}-r{self.release}"
+
+
+    # ---------------------------------------------------------------------------
+    # Helpers de localização de diretório base / rootfs
+    # ---------------------------------------------------------------------------
+
+    def get_base_dir() -> Path:
+        env_home = os.environ.get(SBM_ENV_HOME)
+        if env_home:
+            base = Path(env_home).expanduser().resolve()
+        else:
+            base = Path(__file__).resolve().parent
+        log("DEBUG", f"Base dir: {base}")
+        return base
+
+
+    def get_rootfs_dir() -> Path:
+        env_rootfs = os.environ.get(SBM_ENV_ROOTFS)
+        if env_rootfs:
+            rootfs = Path(env_rootfs).expanduser().resolve()
+        else:
+            rootfs = Path("/")
+        log("DEBUG", f"Rootfs dir: {rootfs}")
+        return rootfs
+
+
+    def ensure_dirs(base: Path) -> Tuple[Path, Path, Path, Path]:
+        repo_dir = base / DEFAULT_REPO_DIR
+        sources_dir = base / DEFAULT_SOURCES_DIR
+        build_dir = base / DEFAULT_BUILD_DIR
+        pkg_dir = base / DEFAULT_PKG_DIR
+        for d in (repo_dir, sources_dir, build_dir, pkg_dir):
+            if not d.exists():
+                log("DEBUG", f"Criando diretório: {d}")
+                d.mkdir(parents=True, exist_ok=True)
+        return repo_dir, sources_dir, build_dir, pkg_dir
+
+
+    # ---------------------------------------------------------------------------
+    # Utilidades de arquivo e segurança
+    # ---------------------------------------------------------------------------
+
+    def sha256sum(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+
+    def is_within_directory(base: Path, target: Path) -> bool:
+        try:
+            base_resolved = base.resolve()
+            target_resolved = target.resolve()
+        except FileNotFoundError:
+            # Se não existe ainda, apenas normalizamos sem resolver symlink
+            base_resolved = base
+            target_resolved = target
+        return str(target_resolved).startswith(str(base_resolved))
+
+
+    def safe_extract_tar(tf: tarfile.TarFile, dest: Path) -> None:
+        """Extrai um tar com mitigação de path traversal (Bug 8).
+
+        Rejeita entradas que escapem do diretório de destino.
+        """
+        for member in tf.getmembers():
+            member_path = dest / member.name
+            if not is_within_directory(dest, member_path):
+                raise SBMError(
+                    f"Entrada potencialmente maliciosa no tar: {member.name!r} (path traversal)"
+                )
+        tf.extractall(dest)
+
+
+    # ---------------------------------------------------------------------------
+    # Localização de pacotes considerando categorias
+    # ---------------------------------------------------------------------------
+
+    def find_package_dir(repo_dir: Path, pkg_id: str) -> Tuple[Path, Optional[str]]:
+        """Encontra o diretório do pacote.
+
+        Suporta:
+          - repo/<nome>/package.yml
+          - repo/<categoria>/<nome>/package.yml
+
+        Se pkg_id tiver '/', é usado como caminho relativo; caso contrário
+        buscamos em repo/ e em repo/<categoria>/.
+        """
+        # pkg_id explícito com categoria, ex: "libs/zlib"
+        if "/" in pkg_id:
+            candidate = (repo_dir / pkg_id).resolve()
+            if not candidate.is_dir():
+                raise SBMError(f"Pacote {pkg_id!r} não encontrado em {repo_dir}")
+            rel = candidate.relative_to(repo_dir)
+            parts = rel.parts
+            category = parts[0] if len(parts) > 1 else None
+            return candidate, category
+
+        # Tentativa direta repo/<nome>
+        direct = repo_dir / pkg_id
+        if direct.is_dir():
+            return direct, None
+
+        # Busca em repo/<categoria>/<nome>
+        candidates = []
+        for cat_dir in repo_dir.iterdir():
+            if cat_dir.is_dir():
+                c = cat_dir / pkg_id
+                if c.is_dir():
+                    candidates.append(c)
+
+        if not candidates:
+            raise SBMError(f"Pacote {pkg_id!r} não encontrado em {repo_dir}")
+
+        if len(candidates) > 1:
+            cats = ", ".join(str(c.relative_to(repo_dir)) for c in candidates)
+            raise SBMError(
+                f"Pacote {pkg_id!r} encontrado em múltiplas categorias: {cats}. "
+                f"Especifique como 'categoria/{pkg_id}'."
+            )
+
+        chosen = candidates[0]
+        rel = chosen.relative_to(repo_dir)
+        parts = rel.parts
+        category = parts[0] if len(parts) > 1 else None
+        return chosen, category
+
+
+    # ---------------------------------------------------------------------------
+    # Carregamento de manifesto (com correções e robustez extra)
+    # ---------------------------------------------------------------------------
+
+    def load_package_meta(repo_dir: Path, pkg_id: str) -> PackageMeta:
+        if yaml is None:
+            raise SBMError(
+                "PyYAML não está instalado. Instale com 'pip install pyyaml' para usar o sbm."
+            )
+
+        pkg_dir, category = find_package_dir(repo_dir, pkg_id)
+        manifest = pkg_dir / "package.yml"
+        if not manifest.is_file():
+            raise SBMError(f"Manifesto 'package.yml' não encontrado em {pkg_dir}")
+
+        log("DEBUG", f"Carregando manifesto: {manifest}")
+        try:
+            raw = manifest.read_text(encoding="utf-8")
+        except OSError as e:
+            raise SBMError(f"Não foi possível ler {manifest}: {e}") from e
+
+        try:
+            data = yaml.safe_load(raw) or {}
+        except Exception as e:
+            # Bug 3: erros de parsing YAML convertidos em SBMError
+            raise SBMError(f"Falha ao analisar YAML em {manifest}: {e}") from e
+
+        if not isinstance(data, dict):
+            raise SBMError(f"Conteúdo inválido em {manifest}: esperado mapeamento YAML.")
+
+        try:
+            name = data.get("name") or pkg_id.split("/")[-1]
+            version = str(data["version"])
+            release = int(data.get("release", 1))
+
+            source_cfg = data["source"]
+            if not isinstance(source_cfg, dict):
+                raise SBMError(f"Campo 'source' inválido em {manifest}.")
+            url = str(source_cfg["url"])
+            filename = str(source_cfg["filename"])
+            sha256 = str(source_cfg["sha256"])
+            source = SourceInfo(url=url, filename=filename, sha256=sha256)
+
+            hooks_cfg = data.get("build", {}) or {}
+            if not isinstance(hooks_cfg, dict):
+                raise SBMError(f"Campo 'build' inválido em {manifest}.")
+            hooks = BuildHooks(
+                pre_configure=str(hooks_cfg.get("pre_configure", "")),
+                configure=str(hooks_cfg.get("configure", "")),
+                pre_build=str(hooks_cfg.get("pre_build", "")),
+                build=str(hooks_cfg.get("build", "")),
+                pre_install=str(hooks_cfg.get("pre_install", "")),
+                install=str(hooks_cfg.get("install", "")),
+                post_install=str(hooks_cfg.get("post_install", "")),
+            )
+
+            arch_val = data.get("arch", ["any"])
+            if isinstance(arch_val, str):
+                arch_list = [arch_val]
+            elif isinstance(arch_val, list):
+                arch_list = [str(a) for a in arch_val]
+            else:
+                raise SBMError(f"Campo 'arch' inválido em {manifest}.")
+
+            deps_val = data.get("depends", [])
+            if isinstance(deps_val, str):
+                depends_list = [deps_val]
+            elif isinstance(deps_val, list):
+                depends_list = [str(d) for d in deps_val]
+            else:
+                raise SBMError(f"Campo 'depends' inválido em {manifest}.")
+
+        except KeyError as e:
+            # Mantém comportamento anterior com mensagem amigável
+            raise SBMError(f"Campo obrigatório ausente em {manifest}: {e}") from e
+        except (TypeError, ValueError) as e:
+            # Bug 3 (complemento): tipos errados tratados de forma amigável
+            raise SBMError(f"Manifesto inválido em {manifest}: {e}") from e
+
+        meta = PackageMeta(
+            pkg_id=pkg_id,
+            name=name,
+            version=version,
+            release=release,
+            arch=arch_list,
+            depends=depends_list,
+            source=source,
+            hooks=hooks,
+            category=category,
+            manifest_path=manifest,
+        )
+        log("DEBUG", f"Meta carregado: {meta}")
+        return meta
+
+
+    def check_arch(meta: PackageMeta) -> None:
+        machine = platform.machine()
+        if "any" in meta.arch:
+            log("DEBUG", f"Pacote {meta.pkg_id} suporta 'any', ignorando checagem de arquitetura.")
+            return
+        if machine not in meta.arch:
+            raise SBMError(
+                f"Pacote {meta.pkg_id} não suporta arquitetura atual ({machine}). "
+                f"Arquiteturas suportadas: {', '.join(meta.arch)}."
+            )
+
+
+    # ---------------------------------------------------------------------------
+    # Download, verificação e extração de source (Bug 1, 8)
+    # ---------------------------------------------------------------------------
+
+    def download_source(meta: PackageMeta, sources_dir: Path) -> Path:
+        sources_dir.mkdir(parents=True, exist_ok=True)
+        src_path = sources_dir / meta.source.filename
+        if src_path.exists():
+            log("INFO", f"Source já existente: {src_path}")
+            return src_path
+
+        log("INFO", f"Baixando source de {meta.source.url} para {src_path}")
+        curl = shutil.which("curl")
+        wget = shutil.which("wget")
+        if not curl and not wget:
+            raise SBMError("Nem 'curl' nem 'wget' encontrados no PATH para download de sources.")
+
+        if curl:
+            cmd = [curl, "-L", "-o", str(src_path), meta.source.url]
+        else:
+            cmd = [wget, "-O", str(src_path), meta.source.url]
+
+        log("DEBUG", f"Executando comando de download: {' '.join(cmd)}")
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            raise SBMError(f"Falha ao baixar source de {meta.source.url} (exit={proc.returncode}).")
+
+        return src_path
+
+
+    def verify_source(meta: PackageMeta, src_path: Path) -> None:
+        log("INFO", f"Verificando SHA256 de {src_path}")
+        actual = sha256sum(src_path).lower()
+        expected = meta.source.sha256.lower()
+        if actual != expected:
+            raise SBMError(
+                f"Soma SHA256 incorreta para {src_path}. "
+                f"Esperado: {expected}, obtido: {actual}."
+            )
+        log("DEBUG", "Checksum OK.")
+
+
+    def extract_source(meta: PackageMeta, src_path: Path, work_dir: Path) -> Path:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        src_root = work_dir / f"{meta.name}-src"
+
+        if src_root.exists():
+            log("DEBUG", f"Removendo diretório antigo de source {src_root}")
+            shutil.rmtree(src_root)
+        src_root.mkdir(parents=True)
+
+        log("INFO", f"Extraindo source {src_path} para {src_root}")
+        # Tenta primeiro como tar (tar.gz, tar.bz2, etc.)
+        if tarfile.is_tarfile(src_path):
+            with tarfile.open(src_path, "r:*") as tf:
+                safe_extract_tar(tf, src_root)
+        else:
+            suffixes = src_path.suffixes
+            # Bug 1: evitar IndexError quando suffixes está vazio
+            last_suffix = suffixes[-1] if suffixes else ""
+            if last_suffix == ".zip":
+                unzip = shutil.which("unzip")
+                if not unzip:
+                    raise SBMError("Arquivo .zip encontrado, mas 'unzip' não está disponível no PATH.")
+                cmd = [unzip, "-q", str(src_path), "-d", str(src_root)]
+                log("DEBUG", f"Executando: {' '.join(cmd)}")
+                proc = subprocess.run(cmd)
+                if proc.returncode != 0:
+                    raise SBMError(f"Falha ao extrair ZIP {src_path} (exit={proc.returncode}).")
+            else:
+                raise SBMError(f"Formato de arquivo não suportado para {src_path} (sufixo: {last_suffix!r}).")
+
+        entries = list(src_root.iterdir())
+        if len(entries) == 1 and entries[0].is_dir():
+            log("DEBUG", f"Usando diretório interno único como raiz do source: {entries[0]}")
+            return entries[0]
+
+        return src_root
+
+
+    # ---------------------------------------------------------------------------
+    # Patches e hooks (Bug 4, 2)
+    # ---------------------------------------------------------------------------
+
+    def apply_patches(pkg_dir: Path, src_root: Path) -> None:
+        patches_dir = pkg_dir / "patches"
+        if not patches_dir.is_dir():
+            log("DEBUG", f"Nenhum diretório de patches encontrado em {patches_dir}")
+            return
+
+        patch_bin = shutil.which("patch")
+        if not patch_bin:
+            raise SBMError("Diretório de patches encontrado, mas 'patch' não está disponível no PATH.")
+
+        patch_files = sorted(patches_dir.glob("*.patch"))
+        if not patch_files:
+            log("DEBUG", f"Nenhum arquivo .patch encontrado em {patches_dir}")
+            return
+
+        for p in patch_files:
+            log("INFO", f"Aplicando patch {p.name}")
+            with p.open("rb") as f:
+                proc = subprocess.run(
+                    [patch_bin, "-p1"],
+                    cwd=str(src_root),
+                    stdin=f,
+                )
+            if proc.returncode != 0:
+                raise SBMError(f"Falha ao aplicar patch {p} (exit={proc.returncode}).")
+
+
+    def run_hook(label: str, script: str, cwd: Path, env: Optional[Dict[str, str]] = None) -> None:
+        if not script or not script.strip():
+            log("DEBUG", f"Hook {label} vazio, ignorando.")
+            return
+
+        base_env = os.environ.copy()
+        if env:
+            base_env.update(env)
+
+        # Bug 4: verificar existência de shell e tratar erro amigavelmente
+        bash = shutil.which("bash")
+        sh = shutil.which("sh")
+        shell = bash or sh
+        if not shell:
+            raise SBMError("Nenhuma shell ('bash' ou 'sh') encontrada no PATH para executar hooks.")
+
+        if shell == bash:
+            cmd = [shell, "-euo", "pipefail", "-c", script]
+        else:
+            # 'sh' genérico: sem -euo pipefail para compatibilidade
+            cmd = [shell, "-c", script]
+
+        log("INFO", f"Executando hook {label} em {cwd} usando {shell}")
+        log("DEBUG", f"Script do hook {label}:
+{script}")
+        try:
+            proc = subprocess.run(cmd, cwd=str(cwd), env=base_env)
+        except FileNotFoundError as e:
+            raise SBMError(f"Falha ao executar hook {label}: shell não encontrada ({e}).") from e
+
+        if proc.returncode != 0:
+            raise SBMError(f"Hook {label} falhou com código {proc.returncode}.")
+
+
+    def copy_files_dir(pkg_dir: Path, destdir: Path) -> None:
+        files_dir = pkg_dir / "files"
+        if not files_dir.is_dir():
+            log("DEBUG", f"Nenhum diretório 'files' encontrado em {files_dir}")
+            return
+
+        log("INFO", f"Copiando arquivos adicionais de {files_dir} para {destdir}")
+        for root, dirs, files in os.walk(files_dir):
+            rel_root = Path(root).relative_to(files_dir)
+            target_root = destdir / rel_root
+            target_root.mkdir(parents=True, exist_ok=True)
+            for fn in files:
+                src_file = Path(root) / fn
+                dst_file = target_root / fn
+                log("DEBUG", f"Copiando {src_file} -> {dst_file}")
+                shutil.copy2(src_file, dst_file)
+
+
+    # ---------------------------------------------------------------------------
+    # Criação e extração de pacotes .tar.zst (Bug 5, 7)
+    # ---------------------------------------------------------------------------
+
+    def _check_tar_zstd_support(tar_cmd: str) -> bool:
+        """Verifica se 'tar' suporta --zstd.
+
+        Bug 5: tratamento de erro mais robusto, sem engolir exceções silenciosamente.
+        """
+        try:
+            log("DEBUG", f"Verificando suporte a --zstd em {tar_cmd} --help")
+            help_out = subprocess.run(
+                [tar_cmd, "--help"],
+                capture_output=True,
+                text=True,
+            )
+        except Exception as e:
+            log("DEBUG", f"Não foi possível verificar 'tar --help': {e}. Prosseguindo assim mesmo.")
+            return True  # vamos deixar falhar na chamada real se não houver suporte
+
+        if help_out.returncode != 0:
+            log("DEBUG", f"'tar --help' retornou código {help_out.returncode}, prosseguindo assim mesmo.")
+            return True
+
+        text = (help_out.stdout or "") + (help_out.stderr or "")
+        if "--zstd" in text:
+            return True
+        return False
+
+
+    def tar_zst_create(src_dir: Path, out_path: Path) -> None:
+        tar_cmd = shutil.which("tar")
+        if not tar_cmd:
+            raise SBMError("'tar' não encontrado no PATH; não é possível criar pacotes.")
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not _check_tar_zstd_support(tar_cmd):
+            raise SBMError("'tar' não suporta --zstd. Instale uma versão com suporte a zstd.")
+
+        cmd = [tar_cmd, "--zstd", "-cf", str(out_path), "-C", str(src_dir), "."]
+        log("INFO", f"Criando pacote {out_path}")
+        log("DEBUG", f"Executando: {' '.join(cmd)}")
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            raise SBMError(f"Falha ao criar pacote {out_path} (exit={proc.returncode}).")
+
+
+    def tar_zst_extract(pkg_path: Path, rootfs: Path) -> None:
+        tar_cmd = shutil.which("tar")
+        if not tar_cmd:
+            raise SBMError("'tar' não encontrado no PATH; não é possível instalar pacotes.")
+
+        if not _check_tar_zstd_support(tar_cmd):
+            # Bug 7: mensagem clara também na extração
+            raise SBMError("'tar' não suporta --zstd. Não é possível extrair pacotes .tar.zst.")
+
+        cmd = [tar_cmd, "--zstd", "-xf", str(pkg_path), "-C", str(rootfs)]
+        log("INFO", f"Instalando pacote {pkg_path} em {rootfs}")
+        log("DEBUG", f"Executando: {' '.join(cmd)}")
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            raise SBMError(f"Falha ao extrair pacote {pkg_path} (exit={proc.returncode}).")
+
+
+    # ---------------------------------------------------------------------------
+    # Pipeline de build (Bug 2, 6)
+    # ---------------------------------------------------------------------------
+
+    def build_package(
+        meta: PackageMeta,
+        base_dir: Path,
+        repo_dir: Path,
+        sources_dir: Path,
+        build_dir: Path,
+        pkg_dir: Path,
+        only_destdir: bool = False,
+    ) -> Path:
+        """Compila e empacota um pacote.
+
+        Se only_destdir=True, apenas prepara o DESTDIR e retorna o caminho.
+        """
+        check_arch(meta)
+
+        pkg_work_dir = build_dir / meta.full_name
+        destdir = pkg_work_dir / "destdir"
+
+        if pkg_work_dir.exists():
+            log("DEBUG", f"Removendo diretório de build anterior {pkg_work_dir}")
+            shutil.rmtree(pkg_work_dir)
+        pkg_work_dir.mkdir(parents=True)
+        destdir.mkdir(parents=True)
+
+        src_path = download_source(meta, sources_dir)
+        verify_source(meta, src_path)
+        src_root = extract_source(meta, src_path, pkg_work_dir)
+
+        # Diretório do pacote no repo (com categorias)
+        pkg_repo_dir, _category = find_package_dir(repo_dir, meta.pkg_id)
+        apply_patches(pkg_repo_dir, src_root)
+
+        env = {
+            "DESTDIR": str(destdir),
+            "SBM_PKG_ID": meta.pkg_id,
+            "SBM_PKG_NAME": meta.name,
+            "SBM_PKG_VERSION": meta.version,
+            "SBM_PKG_RELEASE": str(meta.release),
+            "SBM_BASE_DIR": str(base_dir),  # Bug 6: base_dir agora usado nos hooks
+        }
+
+        # Ordem de execução de hooks, incluindo post_install (Bug 2)
+        run_hook("pre_configure", meta.hooks.pre_configure, src_root, env)
+        run_hook("configure", meta.hooks.configure, src_root, env)
+        run_hook("pre_build", meta.hooks.pre_build, src_root, env)
+        run_hook("build", meta.hooks.build, src_root, env)
+        run_hook("pre_install", meta.hooks.pre_install, src_root, env)
+        run_hook("install", meta.hooks.install, src_root, env)
+        run_hook("post_install", meta.hooks.post_install, src_root, env)
+
+        copy_files_dir(pkg_repo_dir, destdir)
+
+        if only_destdir:
+            log("INFO", f"Build concluído para {meta.pkg_id}; DESTDIR em {destdir}")
+            return destdir
+
+        arch = platform.machine()
+        pkg_out = pkg_dir / f"{meta.full_name}-{arch}.tar.zst"
+        tar_zst_create(destdir, pkg_out)
+        log("INFO", f"Pacote gerado: {pkg_out}")
+        return pkg_out
+
+
+    # ---------------------------------------------------------------------------
+    # Resolução de dependências
+    # ---------------------------------------------------------------------------
+
+    def resolve_deps(target: str, repo_dir: Path) -> List[str]:
+        visited = set()
+        stack = set()
+        order: List[str] = []
+
+        def dfs(pkg_id: str) -> None:
+            if pkg_id in visited:
+                return
+            if pkg_id in stack:
+                raise SBMError(f"Detectado ciclo de dependência envolvendo '{pkg_id}'.")
+
+            stack.add(pkg_id)
+            meta = load_package_meta(repo_dir, pkg_id)
+            log("DEBUG", f"Resolvendo dependências de {pkg_id}: {meta.depends}")
+            for dep in meta.depends:
+                dfs(dep)
+
+            stack.remove(pkg_id)
+            visited.add(pkg_id)
+            order.append(pkg_id)
+
+        dfs(target)
+        log("INFO", f"Ordem de build/instalação: {', '.join(order)}")
+        return order
+
+
+    # ---------------------------------------------------------------------------
+    # Funções auxiliares para upgrade
+    # ---------------------------------------------------------------------------
+
+    def package_filename(meta: PackageMeta) -> str:
+        arch = platform.machine()
+        return f"{meta.full_name}-{arch}.tar.zst"
+
+
+    def needs_rebuild(meta: PackageMeta, pkg_dir: Path) -> bool:
+        """Determina se um pacote precisa ser reconstruído.
+
+        Critério simples: se o pacote não existe, ou se o manifesto é mais novo
+        que o arquivo de pacote.
+        """
+        pkg_path = pkg_dir / package_filename(meta)
+        if not pkg_path.exists():
+            log("DEBUG", f"Pacote {pkg_path} não existe; será reconstruído.")
+            return True
+        if not meta.manifest_path or not meta.manifest_path.exists():
+            return False
+        manifest_mtime = meta.manifest_path.stat().st_mtime
+        pkg_mtime = pkg_path.stat().st_mtime
+        if manifest_mtime > pkg_mtime:
+            log(
+                "DEBUG",
+                f"Manifesto {meta.manifest_path} é mais novo que {pkg_path}; será reconstruído.",
+            )
+            return True
+        return False
+
+
+    # ---------------------------------------------------------------------------
+    # Comandos de alto nível
+    # ---------------------------------------------------------------------------
+
+    def cmd_build(args: argparse.Namespace) -> None:
+        base = get_base_dir()
+        repo_dir, sources_dir, build_dir, pkg_dir = ensure_dirs(base)
+        meta = load_package_meta(repo_dir, args.package)
+        build_package(meta, base, repo_dir, sources_dir, build_dir, pkg_dir, only_destdir=True)
+
+
+    def cmd_build_pkg(args: argparse.Namespace) -> None:
+        base = get_base_dir()
+        repo_dir, sources_dir, build_dir, pkg_dir = ensure_dirs(base)
+        meta = load_package_meta(repo_dir, args.package)
+        build_package(meta, base, repo_dir, sources_dir, build_dir, pkg_dir, only_destdir=False)
+
+
+    def cmd_install(args: argparse.Namespace) -> None:
+        base = get_base_dir()
+        repo_dir, sources_dir, build_dir, pkg_dir = ensure_dirs(base)
+        rootfs = get_rootfs_dir()
+
+        log("INFO", f"Resolvendo dependências para {args.package}")
+        order = resolve_deps(args.package, repo_dir)
+
+        for pkg_id in order:
+            meta = load_package_meta(repo_dir, pkg_id)
+            pkg_name = package_filename(meta)
+            pkg_path = pkg_dir / pkg_name
+            if not pkg_path.exists():
+                log("INFO", f"Pacote {pkg_path} não encontrado; construindo.")
+                build_package(meta, base, repo_dir, sources_dir, build_dir, pkg_dir, only_destdir=False)
+            tar_zst_extract(pkg_path, rootfs)
+
+
+    def cmd_fetch(args: argparse.Namespace) -> None:
+        base = get_base_dir()
+        repo_dir, sources_dir, _build_dir, _pkg_dir = ensure_dirs(base)
+        meta = load_package_meta(repo_dir, args.package)
+        src_path = download_source(meta, sources_dir)
+        verify_source(meta, src_path)
+        log("INFO", f"Source disponível em: {src_path}")
+
+
+    def cmd_graph(args: argparse.Namespace) -> None:
+        base = get_base_dir()
+        repo_dir, _sources_dir, _build_dir, _pkg_dir = ensure_dirs(base)
+        order = resolve_deps(args.package, repo_dir)
+        log("INFO", "Grafo de dependências (em ordem topológica):")
+        for pkg_id in order:
+            meta = load_package_meta(repo_dir, pkg_id)
+            deps = ", ".join(meta.depends) if meta.depends else "-"
+            print(f"{pkg_id} ({meta.name}): {deps}")
+
+
+    # -------------------------
+    # Comando: sync (Git)
+    # -------------------------
+
+    def run_git_cmd(base: Path, args_list: List[str], desc: str) -> None:
+        git = shutil.which("git")
+        if not git:
+            raise SBMError("git não encontrado no PATH; não é possível executar 'sync'.")
+
+        cmd = [git, "-C", str(base)] + args_list
+        log("INFO", f"{desc}: {' '.join(cmd)}")
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            raise SBMError(f"Falha ao {desc} (exit={proc.returncode}).")
+
+
+    def cmd_sync(args: argparse.Namespace) -> None:
+        base = get_base_dir()
+        git_dir = base / ".git"
+        if not git_dir.is_dir():
+            raise SBMError(f"{base} não parece ser um repositório Git ('.git' ausente).")
+
+        # Verifica alterações não commitadas
+        git = shutil.which("git")
+        if not git:
+            raise SBMError("git não encontrado no PATH; não é possível executar 'sync'.")
+
+        status_cmd = [git, "-C", str(base), "status", "--porcelain"]
+        log("DEBUG", f"Verificando alterações locais: {' '.join(status_cmd)}")
+        status = subprocess.run(status_cmd, capture_output=True, text=True)
+        if status.returncode != 0:
+            raise SBMError(f"Falha ao verificar status do Git (exit={status.returncode}).")
+
+        if status.stdout.strip() and not args.force:
+            raise SBMError(
+                "Há alterações locais não commitadas. Faça o commit ou use '--force' para ignorar."
+            )
+
+        remote = args.remote
+        branch = args.branch
+
+        run_git_cmd(base, ["fetch", remote], "executar git fetch")
+        if branch:
+            run_git_cmd(base, ["pull", "--rebase", remote, branch], "executar git pull --rebase")
+        else:
+            run_git_cmd(base, ["pull", "--rebase", remote], "executar git pull --rebase")
+
+        if args.push:
+            if branch:
+                run_git_cmd(base, ["push", remote, branch], "executar git push")
+            else:
+                run_git_cmd(base, ["push", remote], "executar git push")
+
+        log("INFO", "Sincronização Git concluída com sucesso.")
+
+
+    # -------------------------
+    # Comando: upgrade
+    # -------------------------
+
+    def cmd_upgrade(args: argparse.Namespace) -> None:
+        base = get_base_dir()
+        repo_dir, sources_dir, build_dir, pkg_dir = ensure_dirs(base)
+        rootfs = get_rootfs_dir()
+
+        log("INFO", f"Resolvendo dependências para upgrade de {args.package}")
+        order = resolve_deps(args.package, repo_dir)
+
+        for pkg_id in order:
+            meta = load_package_meta(repo_dir, pkg_id)
+            if needs_rebuild(meta, pkg_dir):
+                log("INFO", f"Reconstruindo pacote para upgrade: {pkg_id}")
+                build_package(meta, base, repo_dir, sources_dir, build_dir, pkg_dir, only_destdir=False)
+            else:
+                log("INFO", f"Pacote {pkg_id} já está atualizado; reutilizando artefato.")
+
+            pkg_path = pkg_dir / package_filename(meta)
+            if not pkg_path.exists():
+                raise SBMError(f"Artefato do pacote esperado não encontrado: {pkg_path}")
+            tar_zst_extract(pkg_path, rootfs)
+
+        log("INFO", f"Upgrade de {args.package} concluído.")
+
+
+    # -------------------------
+    # Comando: clean
+    # -------------------------
+
+    def _remove_dir(path: Path) -> None:
+        if path.exists():
+            log("INFO", f"Removendo diretório {path}")
+            shutil.rmtree(path)
+        else:
+            log("DEBUG", f"Diretório {path} não existe; nada a limpar.")
+
+
+    def cmd_clean(args: argparse.Namespace) -> None:
+        base = get_base_dir()
+        repo_dir = base / DEFAULT_REPO_DIR
+        sources_dir = base / DEFAULT_SOURCES_DIR
+        build_dir = base / DEFAULT_BUILD_DIR
+        pkg_dir = base / DEFAULT_PKG_DIR
+
+        # Se nenhum flag específico foi passado, comportamento padrão = limpar build
+        clean_build = args.all or args.build or (not args.sources and not args.packages and not args.all)
+        clean_sources = args.all or args.sources
+        clean_packages = args.all or args.packages
+
+        if clean_build:
+            _remove_dir(build_dir)
+        if clean_sources:
+            _remove_dir(sources_dir)
+        if clean_packages:
+            _remove_dir(pkg_dir)
+
+        # Mantemos repo e rootfs intactos para evitar destruição acidental do sistema.
+        log("INFO", "Limpeza concluída. Repositório e rootfs não foram alterados.")
+
+
+    # ---------------------------------------------------------------------------
+    # Parser de argumentos e main
+    # ---------------------------------------------------------------------------
+
+    def build_arg_parser() -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser(
+            prog="sbm",
+            description=(
+                "sbm - Simple Build Manager
+"
+                "Gerencia build/instalação de pacotes a partir de source.
+"
+                "Suporta categorias em repo/<categoria>/<programa>."
+            ),
+        )
+        parser.add_argument(
+            "-v",
+            "--verbose",
+            action="count",
+            default=0,
+            help="Aumenta verbosidade (use -v para DEBUG).",
+        )
+
+        subparsers = parser.add_subparsers(dest="command", required=True)
+
+        # build (apenas DESTDIR)
+        p_build = subparsers.add_parser("b", help="Build apenas em DESTDIR (sem gerar pacote).")
+        p_build.add_argument("package", help="Nome do pacote (ex: zlib ou libs/zlib).")
+        p_build.set_defaults(func=cmd_build)
+
+        # build + package
+        p_build_pkg = subparsers.add_parser("bp", help="Build e gera pacote .tar.zst.")
+        p_build_pkg.add_argument("package", help="Nome do pacote (ex: zlib ou libs/zlib).")
+        p_build_pkg.set_defaults(func=cmd_build_pkg)
+
+        # install (build on demand + install)
+        p_install = subparsers.add_parser("i", help="Instala pacote (e dependências) no rootfs.")
+        p_install.add_argument("package", help="Nome do pacote (ex: zlib ou libs/zlib).")
+        p_install.set_defaults(func=cmd_install)
+
+        # fetch (apenas baixar e verificar source)
+        p_fetch = subparsers.add_parser("fetch", help="Baixa e verifica apenas o source.")
+        p_fetch.add_argument("package", help="Nome do pacote (ex: zlib ou libs/zlib).")
+        p_fetch.set_defaults(func=cmd_fetch)
+
+        # graph (grafo de dependências)
+        p_graph = subparsers.add_parser("graph", help="Mostra grafo de dependências.")
+        p_graph.add_argument("package", help="Nome do pacote (ex: zlib ou libs/zlib).")
+        p_graph.set_defaults(func=cmd_graph)
+
+        # sync (Git)
+        p_sync = subparsers.add_parser("sync", help="Sincroniza o diretório base com o repositório Git.")
+        p_sync.add_argument(
+            "--remote",
+            default="origin",
+            help="Nome do remote (padrão: origin).",
+        )
+        p_sync.add_argument(
+            "--branch",
+            default=None,
+            help="Nome do branch (se omitido, usa o branch atual).",
+        )
+        p_sync.add_argument(
+            "--force",
+            action="store_true",
+            help="Ignora alterações locais não commitadas.",
+        )
+        p_sync.add_argument(
+            "--push",
+            action="store_true",
+            help="Após pull, executa também git push.",
+        )
+        p_sync.set_defaults(func=cmd_sync)
+
+        # upgrade
+        p_upgrade = subparsers.add_parser("upgrade", help="Atualiza pacote (e dependências) para a versão atual do repo.")
+        p_upgrade.add_argument("package", help="Nome do pacote (ex: zlib ou libs/zlib).")
+        p_upgrade.set_defaults(func=cmd_upgrade)
+
+        # clean
+        p_clean = subparsers.add_parser(
+            "clean",
+            help=(
+                "Limpa diretórios de build/sources/packages de forma segura "
+                "(não altera repo nem rootfs)."
+            ),
+        )
+        p_clean.add_argument(
+            "-a",
+            "--all",
+            action="store_true",
+            help="Limpa build, sources e packages.",
+        )
+        p_clean.add_argument(
+            "--build",
+            action="store_true",
+            help="Limpa apenas diretório de build.",
+        )
+        p_clean.add_argument(
+            "--sources",
+            action="store_true",
+            help="Limpa apenas diretório de sources.",
+        )
+        p_clean.add_argument(
+            "--packages",
+            action="store_true",
+            help="Limpa apenas diretório de packages.",
+        )
+        p_clean.set_defaults(func=cmd_clean)
+
+        return parser
+
+
+    def main(argv: Optional[List[str]] = None) -> int:
+        if argv is None:
+            argv = sys.argv[1:]
+
+        parser = build_arg_parser()
+        args = parser.parse_args(argv)
+
+        # Configura nível de log global
+        verbosity = getattr(args, "verbose", 0) or 0
+        set_log_level_from_verbosity(verbosity)
+        log("DEBUG", f"Argumentos recebidos: {args}")
+
+        try:
+            args.func(args)
+            return 0
+        except SBMError as e:
+            log("ERROR", str(e))
+            return 1
+        except KeyboardInterrupt:
+            log("WARN", "Interrompido pelo usuário (Ctrl+C).")
+            return 130
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
