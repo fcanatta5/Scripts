@@ -1,0 +1,8 @@
+#
+# /etc/ports/opt.httpup: the opt collection
+#
+
+ROOT_DIR=/usr/ports/opt
+URL=http://crux.nu/ports/crux-2.4/opt
+
+# End of file
