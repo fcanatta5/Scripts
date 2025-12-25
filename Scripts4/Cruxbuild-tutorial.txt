@@ -1,0 +1,293 @@
+CRUXBUILD – TUTORIAL COMPLETO
+=============================
+
+Este documento descreve o uso completo do cruxbuild para:
+- criar e manter um ports tree
+- construir pacotes
+- resolver dependências
+- manter um toolchain (musl)
+- continuar a construção de um sistema inteiro
+- operar com segurança (dry-run, logs, footprint)
+
+------------------------------------------------------------
+1. CONCEITOS FUNDAMENTAIS
+------------------------------------------------------------
+
+CRUX segue o princípio:
+  "o PKGFILE manda, o construtor executa"
+
+O cruxbuild:
+- não esconde etapas
+- não adivinha dependências
+- apenas executa PKGFILEs em ordem correta
+- registra tudo em logs
+
+Estrutura geral:
+
+  ports/
+    categoria/
+      programa/
+        PKGFILE
+        .md5sum        (opcional)
+        .footprint     (opcional)
+        patches/       (opcional)
+        files/         (opcional)
+
+------------------------------------------------------------
+2. INICIALIZAR UM PORTS TREE
+------------------------------------------------------------
+
+Criar um tree:
+
+  ./init-ports-tree.sh ports
+
+Criar um novo port:
+
+  ports/.tools/newport.sh ports core musl
+
+Validar estrutura:
+
+  ports/.tools/doctor-tree.sh ports
+
+------------------------------------------------------------
+3. ESTRUTURA DE UM PKGFILE
+------------------------------------------------------------
+
+Variáveis obrigatórias:
+  name
+  version
+  release
+  source=(...)
+
+Variáveis opcionais:
+  depends=(...)
+
+Funções suportadas:
+  prepare()        # opcional
+  build()          # obrigatória
+  post_install()   # opcional
+
+Exemplo mínimo:
+
+  name=hello
+  version=1.0
+  release=1
+
+  source=(hello-1.0.tar.gz)
+
+  build() {
+      cd "$SRC/hello-1.0"
+      make
+      make DESTDIR="$PKG" install
+  }
+
+------------------------------------------------------------
+4. COMANDOS BÁSICOS DO CRUXBUILD
+------------------------------------------------------------
+
+Listar todos os ports:
+
+  cruxbuild.py --root ports list
+
+Buscar por nome ou caminho:
+
+  cruxbuild.py --root ports search gcc
+
+Mostrar informações de um port:
+
+  cruxbuild.py --root ports info musl
+
+------------------------------------------------------------
+5. DEPENDÊNCIAS
+------------------------------------------------------------
+
+Dependências são declaradas no PKGFILE:
+
+  depends=(linux-headers zlib)
+
+Ver ordem de construção:
+
+  cruxbuild.py --root ports depgraph gcc --format order
+
+Se houver ciclo:
+
+  dependency cycle detected: a -> b -> c -> a
+
+------------------------------------------------------------
+6. DRY-RUN (PLANEJAMENTO)
+------------------------------------------------------------
+
+Nunca construa algo grande sem dry-run.
+
+Exemplo:
+
+  cruxbuild.py --root ports build -d --dry-run gcc
+
+Isso mostra:
+- ordem de build
+- o que será instalado
+- sem executar nada
+
+------------------------------------------------------------
+7. CONSTRUÇÃO DE UM PACOTE
+------------------------------------------------------------
+
+Construir apenas um port:
+
+  cruxbuild.py --root ports build musl
+
+Construir com dependências:
+
+  cruxbuild.py --root ports build -d musl
+
+------------------------------------------------------------
+8. INSTALAÇÃO AUTOMÁTICA (MODO BINÁRIO)
+------------------------------------------------------------
+
+Instalar pacotes após build via pkgadd:
+
+  sudo cruxbuild.py --root ports build -d --auto-install gcc
+
+Pular pacotes já instalados:
+
+  sudo cruxbuild.py --root ports build -d --auto-install --skip-installed gcc
+
+------------------------------------------------------------
+9. PATCHES AUTOMÁTICOS
+------------------------------------------------------------
+
+Coloque patches em:
+
+  ports/core/musl/patches/
+    0001-fix.patch
+    0002-security.diff
+
+Eles serão aplicados automaticamente:
+- em $SRC
+- em ordem alfabética
+- usando patch -p1
+
+------------------------------------------------------------
+10. FILES OVERLAY
+------------------------------------------------------------
+
+Arquivos extras:
+
+  ports/app/foo/files/etc/foo.conf
+
+Será instalado como:
+
+  /etc/foo.conf
+
+Cópia ocorre:
+- após build()
+- antes de post_install()
+
+------------------------------------------------------------
+11. .md5sum
+------------------------------------------------------------
+
+Criar ou atualizar:
+
+  cruxbuild.py --root ports build --md5-update musl
+
+Verificação ocorre automaticamente no build.
+
+------------------------------------------------------------
+12. .footprint
+------------------------------------------------------------
+
+Criar ou atualizar:
+
+  cruxbuild.py --root ports build --footprint-update musl
+
+Se mudar sem atualizar:
+  build falha (proteção contra alterações não intencionais)
+
+------------------------------------------------------------
+13. LOGS E CACHE
+------------------------------------------------------------
+
+Logs:
+  ~/.cache/cruxbuild/logs/<port>.log
+
+Sources:
+  ~/.cache/cruxbuild/distfiles/
+
+Workdir:
+  ~/.cache/cruxbuild/work/<port>/
+
+Pacotes gerados:
+  ~/.cache/cruxbuild/packages/
+
+------------------------------------------------------------
+14. LIMPEZA
+------------------------------------------------------------
+
+Limpar workdir de um port:
+
+  cruxbuild.py --root ports clean gcc
+
+Limpar tudo (cache completo):
+
+  cruxbuild.py clean --all
+
+------------------------------------------------------------
+15. TOOLCHAIN NATIVO (MUSL)
+------------------------------------------------------------
+
+Ordem correta:
+
+  linux-headers
+  musl
+  zlib
+  gmp
+  mpfr
+  mpc
+  isl
+  binutils
+  gcc
+
+Construção recomendada:
+
+  cruxbuild.py --root core build -d --dry-run gcc
+  sudo cruxbuild.py --root core build -d --auto-install --skip-installed gcc
+
+------------------------------------------------------------
+16. APÓS ATUALIZAR O TOOLCHAIN
+------------------------------------------------------------
+
+Boas práticas:
+- testar gcc:
+    gcc -v
+    echo 'int main(){}' | gcc -x c -
+
+- reconstruir bibliotecas centrais
+- reconstruir o “mundo” se necessário
+
+------------------------------------------------------------
+17. BOAS PRÁTICAS GERAIS
+------------------------------------------------------------
+
+- Sempre usar dry-run
+- Sempre revisar .footprint
+- Nunca esconder lógica no PKGFILE
+- Preferir simplicidade ao automatismo
+- Rebuild é normal, não erro
+
+------------------------------------------------------------
+18. FILOSOFIA FINAL
+------------------------------------------------------------
+
+CRUX + cruxbuild não prometem conveniência.
+Eles oferecem:
+- controle
+- previsibilidade
+- transparência
+- sistemas auditáveis
+
+Se algo quebra, você sabe exatamente onde e por quê.
+
+============================================================
+FIM DO TUTORIAL
+============================================================
