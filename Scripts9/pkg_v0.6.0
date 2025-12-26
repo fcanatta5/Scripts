@@ -1,0 +1,1322 @@
+#!/usr/bin/env bash
+# pkg - CRUX-like source-based package builder/manager
+# License: MIT
+#
+# v0.5.0 improvements (best-effort hardening):
+# - Fix parse_git_ref() (#ref parsing)
+# - Stronger transactional apply: staged extraction + preflight + backups + atomic renames when possible
+# - Better metadata preservation: tar extract with -p, --same-owner (root), numeric owner when supported
+# - Conflict detection: refuses to overwrite files owned by other installed packages (unless --force)
+# - More complete hooks: pre_install/post_install, pre_remove/post_remove, pre_upgrade/post_upgrade
+# - Dependency "solver": topological order build/install with cycle detection; supports simple dep specs (foo>=1.2 -> foo)
+# - Richer cache index: name, category, portdir, version, release (best-effort parse)
+# - Obsolete removal hardened: skips directories and preserves modified unless --force-remove
+#
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+PKG_VERSION="0.5.0"
+
+: "${PKGROOT:=/}"
+: "${PKGSTATE:=${PKGROOT%/}/var/lib/pkg}"
+: "${PKGCACHE:=${PKGSTATE}/cache}"
+: "${SOURCES_DIR:=${PKGCACHE}/sources}"
+: "${BUILDS_DIR:=${PKGCACHE}/build}"
+: "${BIN_DIR:=${PKGCACHE}/bin}"
+: "${LOG_DIR:=${PKGSTATE}/logs}"
+: "${INSTALLED_DIR:=${PKGSTATE}/installed}"
+: "${REPOS_DIR:=${PKGSTATE}/repos}"
+: "${REPOS_CONF:=${PKGSTATE}/repos.conf}"
+: "${INDEX_FILE:=${PKGCACHE}/ports.index.tsv}"
+: "${OWNERS_FILE:=${PKGCACHE}/owners.tsv}"
+: "${STAGING_DIR:=${PKGSTATE}/staging}"
+: "${PORTS_DIRS:=}"
+
+default_ports_dirs() {
+  if [[ -d "./ports" ]]; then echo "./ports"; else echo "/usr/ports"; fi
+  echo "$REPOS_DIR"
+}
+
+DRY_RUN=0
+VERBOSE=0
+KEEP_WORK=0
+FORCE=0
+FORCE_REMOVE=0
+REBUILD=0
+JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+
+die() { echo "pkg: error: $*" >&2; exit 1; }
+warn(){ echo "pkg: warning: $*" >&2; }
+info(){ echo "pkg: $*"; }
+vinfo(){ ((VERBOSE)) && info "$@"; }
+run() { if ((DRY_RUN)); then echo "+ $*"; else ((VERBOSE)) && echo "+ $*"; "$@"; fi; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+mkd() { local p; for p in "$@"; do [[ -n "$p" ]] && run mkdir -p "$p"; done; }
+as_root_needed() { if [[ "${PKGROOT}" == "/" ]]; then [[ "$(id -u)" -eq 0 ]] || die "requires root (or set PKGROOT)"; fi; }
+trap_err() { local ec=$?; echo "pkg: failed (exit code $ec)" >&2; exit "$ec"; }
+trap trap_err ERR
+
+usage() {
+  cat <<'EOF'
+pkg - CRUX-like source-based package builder/manager
+
+Global options:
+  --root <path>
+  --ports <p1[:p2...]>
+  --dry-run
+  --verbose
+  --keep-work
+  --force                 overwrite cached artifacts or bypass conflict checks
+  --rebuild               force rebuild even if fingerprint matches
+  --force-remove          remove modified files too
+  -j, --jobs <n>
+
+Commands:
+  repo list|add|remove|update
+  repo-list                 List all ports (uses cache if present)
+  cache                     Rebuild ports cache/index (also rebuilds owners map)
+  search <term>             Search ports; shows ✔ for installed
+  path <pkg>                Show physical port directory path
+  quickdep <pkg|portdir>    Show direct depends/makedepends (no recursion)
+  depends <pkg|portdir>     Show recursive dependencies; ✔ for installed
+  fetch <pkg|portdir>
+  build <pkg|portdir>
+  install <name> [--from <pkg|portdir>]
+  remove <name>
+  upgrade <name|all>        Transactional upgrade (staging then swap)
+  list
+  info <name>
+  clean <name> | clean --all
+  gc
+EOF
+}
+
+version() { echo "pkg ${PKG_VERSION}"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root) PKGROOT="$2"; shift 2 ;;
+    --ports) PORTS_DIRS="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
+    --keep-work) KEEP_WORK=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --rebuild) REBUILD=1; shift ;;
+    --force-remove) FORCE_REMOVE=1; shift ;;
+    -j|--jobs) JOBS="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -V|--version) version; exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+cmd="${1:-}"; shift || true
+PKGROOT="${PKGROOT%/}"; [[ -z "$PKGROOT" ]] && PKGROOT="/"
+
+
+needs_lock() {
+  local cmd="$1"
+  case "$cmd" in
+    repo|cache|fetch|build|install|remove|upgrade|clean|gc) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+init_layout() {
+  mkd "$PKGSTATE" "$PKGCACHE" "$SOURCES_DIR" "$BUILDS_DIR" "$BIN_DIR" "$LOG_DIR" "$INSTALLED_DIR" "$REPOS_DIR" "$STAGING_DIR"
+  if [[ ! -f "$REPOS_CONF" && $DRY_RUN -eq 0 ]]; then : >"$REPOS_CONF"; fi
+}
+
+start_logging() {
+  local ts; ts="$(date -u +"%Y%m%dT%H%M%SZ")"
+  local lf="${LOG_DIR}/pkg-${ts}-$$.log"
+  if ((DRY_RUN)); then echo "+ (logging would go to $lf)"; return 0; fi
+  exec > >(tee -a "$lf") 2>&1
+  info "logfile: $lf"
+}
+
+# ---------------- Locking ----------------
+LOCK_FILE="${PKGSTATE}/lock"
+
+lock_acquire() {
+  # Global lock for stateful operations (cache/build/install/upgrade/remove/repo sync/clean/gc/fetch).
+  mkd "$PKGSTATE"
+  if command -v flock >/dev/null 2>&1; then
+    exec 200>"$LOCK_FILE"
+    flock -n 200 || die "another pkg process is running (lock: $LOCK_FILE)"
+  else
+    # Portable fallback: mkdir-based lock
+    local ld="${LOCK_FILE}.d"
+    if ! mkdir "$ld" 2>/dev/null; then
+      die "another pkg process is running (lock: $ld)"
+    fi
+  fi
+}
+
+lock_release() {
+  if command -v flock >/dev/null 2>&1; then
+    flock -u 200 2>/dev/null || true
+  else
+    rm -rf "${LOCK_FILE}.d" 2>/dev/null || true
+  fi
+}
+
+
+get_ports_roots() {
+  # Return unique, existing roots in priority order.
+  # PORTS_DIRS may be a ':' separated list.
+  local roots=()
+  if [[ -n "${PORTS_DIRS:-}" ]]; then
+    IFS=':' read -r -a roots <<<"${PORTS_DIRS}"
+  else
+    while IFS= read -r p; do roots+=("$p"); done < <(default_ports_dirs)
+  fi
+
+  local out=() seen=() r
+  declare -A seen=()
+  for r in "${roots[@]}"; do
+    [[ -n "$r" ]] || continue
+    r="${r%/}"
+    [[ -d "$r" ]] || continue
+    if [[ -z "${seen[$r]:-}" ]]; then
+      seen["$r"]=1
+      out+=("$r")
+    fi
+  done
+  printf '%s\n' "${out[@]}"
+}
+
+
+is_portdir() { [[ -d "$1" && -f "$1/Pkgfile" ]]; }
+
+resolve_portdir() {
+  local ref="$1"
+  if is_portdir "$ref"; then echo "$ref"; return 0; fi
+
+  local name="$ref" root
+  local -a matches=()
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    # Search for */<name>/Pkgfile inside this root (category/name/Pkgfile or name/Pkgfile)
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      matches+=("$f")
+    done < <(find "$root" -type f -name Pkgfile -path "*/${name}/Pkgfile" 2>/dev/null | sort)
+
+    if ((${#matches[@]})); then
+      # If multiple matches in the same root, prefer the shortest path and warn.
+      if ((${#matches[@]} > 1)); then
+        warn "multiple ports matched for '${name}' under '${root}'; using: ${matches[0]}"
+      fi
+      echo "$(dirname "${matches[0]}")"
+      return 0
+    fi
+  done < <(get_ports_roots)
+
+  die "could not resolve port '$name'"
+}
+
+
+# ---------------- Repo management ----------------
+repo_list() { [[ -s "$REPOS_CONF" ]] && cat "$REPOS_CONF" || echo "(no repos configured)"; }
+
+repo_add() {
+  local name="$1" type="$2" url="$3" ref="${4:-}"
+  [[ -n "$name" && -n "$type" && -n "$url" ]] || die "usage: pkg repo add <name> git <url> [ref] | rsync <src>"
+  [[ "$type" == "git" || "$type" == "rsync" ]] || die "repo type must be git or rsync"
+  if ((DRY_RUN)); then
+    echo "+ update $REPOS_CONF: $name $type $url $ref"
+  else
+    tmp="$(mktemp)"
+    awk -v n="$name" '$1!=n{print}' "$REPOS_CONF" >"$tmp" || true
+    mv -f "$tmp" "$REPOS_CONF"
+    printf '%s\t%s\t%s\t%s\n' "$name" "$type" "$url" "$ref" >>"$REPOS_CONF"
+  fi
+  info "repo added: $name"
+}
+
+repo_remove() {
+  local name="$1"; [[ -n "$name" ]] || die "usage: pkg repo remove <name>"
+  if ((DRY_RUN)); then
+    echo "+ remove $name from $REPOS_CONF and delete $REPOS_DIR/$name"
+  else
+    tmp="$(mktemp)"
+    awk -v n="$name" '$1!=n{print}' "$REPOS_CONF" >"$tmp" || true
+    mv -f "$tmp" "$REPOS_CONF"
+    rm -rf "${REPOS_DIR:?}/$name" || true
+  fi
+  info "repo removed: $name"
+}
+
+repo_update_one() {
+  local name="$1" type="$2" url="$3" ref="$4" dest="${REPOS_DIR}/${name}"
+  if [[ "$type" == "git" ]]; then
+    need_cmd git
+    if [[ -d "$dest/.git" ]]; then
+      info "repo update (git): $name"
+      run git -C "$dest" fetch --prune --tags
+      if [[ -n "$ref" ]]; then
+        run git -C "$dest" checkout --quiet "$ref"
+      fi
+      # Do not ignore failures: a broken repo should be explicit.
+      run git -C "$dest" pull --ff-only
+    else
+      info "repo clone (git): $name"
+      if ((DRY_RUN)); then echo "+ rm -rf \"$dest\" && git clone \"$url\" \"$dest\""
+      else rm -rf "$dest" || true; git clone "$url" "$dest"; fi
+      [[ -n "$ref" ]] && run git -C "$dest" checkout --quiet "$ref"
+    fi
+  elif [[ "$type" == "rsync" ]]; then
+    need_cmd rsync
+    info "repo sync (rsync): $name"
+
+    # Safety guards
+    [[ -n "$dest" && "$dest" != "/" ]] || die "unsafe rsync destination: '$dest'"
+    mkd "$dest"
+
+    local src="$url"
+    # Ensure trailing slash semantics (sync content of src into dest)
+    [[ "$src" == */ ]] || src="${src}/"
+
+    # Safer delete behavior: delete-delay (or delete-after if not supported), and delay updates.
+    local -a opts=(-a --delay-updates --partial --safe-links --delete-delay)
+    if ! rsync --help 2>/dev/null | grep -q -- '--delete-delay'; then
+      opts=(-a --delay-updates --partial --safe-links --delete-after)
+    fi
+    run rsync "${opts[@]}" "$src" "${dest}/"
+  else
+    die "unknown repo type: $type"
+  fi
+}
+
+
+repo_update() {
+  local which="${1:-all}"
+  [[ -f "$REPOS_CONF" ]] || die "repos config missing"
+  [[ -s "$REPOS_CONF" ]] || { warn "no repos configured"; return 0; }
+  local name type url ref
+  while IFS=$'\t' read -r name type url ref; do
+    [[ -z "$name" ]] && continue
+    [[ "$which" != "all" && "$which" != "$name" ]] && continue
+    repo_update_one "$name" "$type" "$url" "$ref"
+  done <"$REPOS_CONF"
+}
+
+# ---------------- Recipe loading ----------------
+read_recipe() {
+  local portdir="$1" pkgfile="${portdir%/}/Pkgfile"
+  [[ -f "$pkgfile" ]] || die "Pkgfile not found: $pkgfile"
+  (
+    set -Eeuo pipefail
+    export LC_ALL=C
+    export PATH="/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"
+    # shellcheck disable=SC1090
+    source "$pkgfile"
+    [[ -n "${name:-}" && -n "${version:-}" && -n "${release:-}" ]] || { echo "missing name/version/release" >&2; exit 3; }
+    declare -F build >/dev/null || { echo "missing build()" >&2; exit 3; }
+    printf '%s\0' "$name" "$version" "$release"
+    printf '%s\0' "${source[@]:-}"; printf '\0'
+    printf '%s\0' "${sha256sums[@]:-}"; printf '\0'
+    printf '%s\0' "${depends[@]:-}"; printf '\0'
+    printf '%s\0' "${makedepends[@]:-}"
+  )
+}
+
+parse_recipe_stream() {
+  mapfile -d '' -t _parts <"$1" || true
+  [[ ${#_parts[@]} -ge 3 ]] || die "internal: invalid recipe stream"
+  R_NAME="${_parts[0]}"; R_VERSION="${_parts[1]}"; R_RELEASE="${_parts[2]}"
+  R_SOURCES=(); R_SUMS=(); R_DEPENDS=(); R_MAKEDEPENDS=()
+  local i=3
+  for ((; i<${#_parts[@]}; i++)); do [[ -z "${_parts[i]}" ]] && { ((i++)); break; }; R_SOURCES+=("${_parts[i]}"); done
+  for ((; i<${#_parts[@]}; i++)); do [[ -z "${_parts[i]}" ]] && { ((i++)); break; }; R_SUMS+=("${_parts[i]}"); done
+  for ((; i<${#_parts[@]}; i++)); do [[ -z "${_parts[i]}" ]] && { ((i++)); break; }; R_DEPENDS+=("${_parts[i]}"); done
+  for ((; i<${#_parts[@]}; i++)); do [[ -z "${_parts[i]}" ]] && continue; R_MAKEDEPENDS+=("${_parts[i]}"); done
+}
+
+hash_file_list() { need_cmd sha256sum; for f in "$@"; do [[ -f "$f" ]] && sha256sum "$f"; done | sha256sum | awk '{print $1}'; }
+
+recipe_fingerprint() {
+  local portdir="$1" pkgfile="${portdir%/}/Pkgfile" pdir="${portdir%/}/patches" fdir="${portdir%/}/files"
+  local files=("$pkgfile")
+  [[ -d "$pdir" ]] && while IFS= read -r p; do files+=("$p"); done < <(find "$pdir" -type f \( -name '*.patch' -o -name '*.diff' \) 2>/dev/null | sort || true)
+  [[ -d "$fdir" ]] && while IFS= read -r p; do files+=("$p"); done < <(find "$fdir" -type f 2>/dev/null | sort || true)
+  hash_file_list "${files[@]}"
+}
+
+# ---------------- Installed DB helpers ----------------
+is_installed() { [[ -d "${INSTALLED_DIR}/$1" ]]; }
+installed_version_release() {
+  local meta="${INSTALLED_DIR}/${1}/meta"; [[ -f "$meta" ]] || return 1
+  local v r
+  v="$(awk -F= '$1=="version"{print $2}' "$meta" 2>/dev/null || true)"
+  r="$(awk -F= '$1=="release"{print $2}' "$meta" 2>/dev/null || true)"
+  [[ -n "$v" && -n "$r" ]] || return 1
+  echo "${v}-${r}"
+}
+
+# ---------------- Owners/conflicts map ----------------
+rebuild_owners() {
+  info "rebuilding owners map: $OWNERS_FILE"
+  if ((DRY_RUN)); then echo "+ scan installed db and write $OWNERS_FILE"; return 0; fi
+  mkd "$(dirname "$OWNERS_FILE")"
+  local tmpo; tmpo="$(mktemp)"
+  : >"$tmpo"
+
+  local pkg filesf file
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    [[ -d "${INSTALLED_DIR}/${pkg}" ]] || continue
+    filesf="${INSTALLED_DIR}/${pkg}/files"
+    [[ -f "$filesf" ]] || continue
+    while IFS= read -r file; do
+      [[ -n "$file" ]] || continue
+      printf '%s\t%s\n' "$file" "$pkg" >>"$tmpo"
+    done < <(awk 'NF' "$filesf")
+  done < <(ls -1 "$INSTALLED_DIR" 2>/dev/null | sort || true)
+
+  # Keep first owner per path (stable by pkg sort); deterministic output
+  awk -F'\t' '!seen[$1]++{print $1"\t"$2}' "$tmpo" | sort -t$'\t' -k1,1 >"${OWNERS_FILE}.tmp"
+  rm -f "$tmpo"
+  mv -f "${OWNERS_FILE}.tmp" "$OWNERS_FILE"
+}
+
+
+owner_of_path() {
+  local rel="$1"
+  [[ -f "$OWNERS_FILE" ]] || return 1
+  awk -F'\t' -v p="$rel" '$1==p{print $2; exit 0}' "$OWNERS_FILE" 2>/dev/null || true
+}
+
+check_conflicts_tarball() {
+  # Abort if a file in tarball belongs to another installed package (unless --force).
+  # Validates tarball entries as a preflight.
+  local pkgname="$1" tarball="$2"
+  ((FORCE)) && return 0
+
+  tar_validate_tarball "$tarball"
+
+  [[ -f "$OWNERS_FILE" ]] || rebuild_owners
+  local rel owner
+  while IFS= read -r rel; do
+    rel="${rel#./}"
+    [[ -n "$rel" ]] || continue
+    [[ "$rel" == */ ]] && continue
+    # Skip pax headers
+    [[ "$rel" == "././@PaxHeader" || "$rel" == "@PaxHeader" || "$rel" == *"/@PaxHeader" ]] && continue
+    owner="$(owner_of_path "$rel" || true)"
+    [[ -z "$owner" || "$owner" == "$pkgname" ]] && continue
+    die "conflict: '$rel' is owned by '$owner' (use --force to override)"
+  done < <(tar -tzf "$tarball" 2>/dev/null | awk 'NF' || tar -tf "$tarball" 2>/dev/null | awk 'NF')
+}
+
+
+# ---------------- Ports index cache ----------------
+parse_pkgfile_fast() {
+  # Best-effort, non-executing parse of name/version/release.
+  # Only extracts simple literal assignments like:
+  #   name=foo | name="foo" | name='foo'
+  # It intentionally ignores values containing '$', '`', '$(' to avoid "smart" evaluation.
+  local pkgfile="$1"
+  local name="" version="" release="" v k val
+  while IFS= read -r v; do
+    # Strip leading/trailing whitespace
+    v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    [[ -n "$v" ]] || continue
+    [[ "$v" == \#* ]] && continue
+
+    if [[ "$v" =~ ^(name|version|release)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      k="${BASH_REMATCH[1]}"
+      val="${BASH_REMATCH[2]}"
+      # Remove inline comments (best-effort) for unquoted literals
+      if [[ "$val" != \"*\" && "$val" != \'*\' ]]; then
+        val="${val%%#*}"
+      fi
+      # Trim whitespace
+      val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+
+      # Reject "computed" values
+      if [[ "$val" == *'$'* || "$val" == *'`'* || "$val" == *'$('* ]]; then
+        continue
+      fi
+
+      # Unquote
+      if [[ "$val" =~ ^\"(.*)\"$ ]]; then val="${BASH_REMATCH[1]}"; fi
+      if [[ "$val" =~ ^\'(.*)\'$ ]]; then val="${BASH_REMATCH[1]}"; fi
+
+      case "$k" in
+        name) [[ -z "$name" ]] && name="$val" ;;
+        version) [[ -z "$version" ]] && version="$val" ;;
+        release) [[ -z "$release" ]] && release="$val" ;;
+      esac
+    fi
+    [[ -n "$name" && -n "$version" && -n "$release" ]] && break
+  done <"$pkgfile"
+  echo "${name}" "${version}" "${release}"
+}
+
+
+rebuild_cache() {
+  info "rebuilding ports cache: $INDEX_FILE"
+  if ((DRY_RUN)); then
+    echo "+ scan ports roots and write $INDEX_FILE"
+    echo "+ rebuild owners map $OWNERS_FILE"
+    return 0
+  fi
+
+  mkd "$(dirname "$INDEX_FILE")"
+  local tmpi; tmpi="$(mktemp)"
+  : >"$tmpi"
+
+  local root pkgfile portdir dname cat parsed pname ver rel
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    while IFS= read -r pkgfile; do
+      [[ -n "$pkgfile" ]] || continue
+      portdir="$(dirname "$pkgfile")"
+      dname="$(basename "$portdir")"
+      cat="$(basename "$(dirname "$portdir")")"
+      if [[ "$(dirname "$portdir")" == "$root" ]]; then cat="-"; fi
+
+      parsed="$(parse_pkgfile_fast "$pkgfile" || true)"
+      pname="$(awk '{print $1}' <<<"$parsed")"
+      ver="$(awk '{print $2}' <<<"$parsed")"
+      rel="$(awk '{print $3}' <<<"$parsed")"
+      [[ -n "$pname" ]] || pname="$dname"
+
+      printf '%s\t%s\t%s\t%s\t%s\n' "$pname" "$cat" "$portdir" "${ver:-}" "${rel:-}" >>"$tmpi"
+    done < <(find "$root" -type f -name Pkgfile 2>/dev/null | sort)
+  done < <(get_ports_roots)
+
+  # Deterministic, de-dup by (name,portdir)
+  sort -u -t$'\t' -k1,1 -k3,3 "$tmpi" >"${INDEX_FILE}.tmp"
+  rm -f "$tmpi"
+  mv -f "${INDEX_FILE}.tmp" "$INDEX_FILE"
+
+  rebuild_owners
+}
+
+
+ensure_cache() { [[ -f "$INDEX_FILE" ]] || rebuild_cache; }
+
+cmd_repo_list_ports() {
+  ensure_cache
+  [[ -s "$INDEX_FILE" ]] || { echo "(no ports found)"; return 0; }
+  awk -F'\t' '{ if($2=="-") print $1; else print $2"/"$1 }' "$INDEX_FILE" | sort
+}
+
+cmd_search() {
+  local term="${1:-}"; [[ -n "$term" ]] || die "usage: pkg search <term>"
+  ensure_cache
+  local line name cat path
+  while IFS=$'\t' read -r name cat path _v _r; do
+    [[ "$name" == *"$term"* || "$cat" == *"$term"* || "$path" == *"$term"* ]] || continue
+    local mark=""
+    if is_installed "$name"; then mark="✔"; fi
+    if [[ "$cat" == "-" ]]; then printf '%s %s\n' "$name" "$mark"
+    else printf '%s/%s %s\n' "$cat" "$name" "$mark"; fi
+  done <"$INDEX_FILE"
+}
+
+cmd_path() { local ref="${1:-}"; [[ -n "$ref" ]] || die "usage: pkg path <pkg>"; echo "$(resolve_portdir "$ref")"; }
+
+# ---------------- Dependency utilities ("solver") ----------------
+normalize_dep() {
+  # strips simple version constraints/operators, e.g. foo>=1.2 -> foo
+  local d="$1"
+  d="${d%% *}"                 # strip after space
+  d="${d%%>=*}"; d="${d%%<=*}"; d="${d%%==*}"; d="${d%%=*}"
+  d="${d%%>*}"; d="${d%%<*}"; d="${d%%:*}"
+  echo "$d"
+}
+
+quickdep_print() {
+  local portdir="$1"
+  local tmp; tmp="$(mktemp)"; read_recipe "$portdir" >"$tmp"; parse_recipe_stream "$tmp"; rm -f "$tmp"
+  echo "depends: ${R_DEPENDS[*]:-}"
+  echo "makedepends: ${R_MAKEDEPENDS[*]:-}"
+}
+
+cmd_quickdep() {
+  local ref="${1:-}"; [[ -n "$ref" ]] || die "usage: pkg quickdep <pkg|portdir>"
+  local portdir; portdir="$(resolve_portdir "$ref")"
+  quickdep_print "$portdir"
+}
+
+declare -A _dep_seen_list=()
+dep_collect_recursive() {
+  local ref="$1"
+  local portdir; portdir="$(resolve_portdir "$ref")"
+  local tmp; tmp="$(mktemp)"; read_recipe "$portdir" >"$tmp"; parse_recipe_stream "$tmp"; rm -f "$tmp"
+  local dep ndep
+  for dep in "${R_MAKEDEPENDS[@]}" "${R_DEPENDS[@]}"; do
+    [[ -n "$dep" ]] || continue
+    ndep="$(normalize_dep "$dep")"
+    [[ -n "$ndep" ]] || continue
+    if [[ -n "${_dep_seen_list[$ndep]:-}" ]]; then continue; fi
+    _dep_seen_list["$ndep"]=1
+    echo "$ndep"
+    if resolve_portdir "$ndep" >/dev/null 2>&1; then
+      dep_collect_recursive "$ndep"
+    else
+      warn "missing port for dependency: $ndep (referenced by $ref)"
+    fi
+  done
+}
+
+
+cmd_depends() {
+  local ref="${1:-}"; [[ -n "$ref" ]] || die "usage: pkg depends <pkg|portdir>"
+  _dep_seen_list=()
+  local dep
+  while IFS= read -r dep; do
+    [[ -n "$dep" ]] || continue
+    local mark=""; is_installed "$dep" && mark="✔"
+    printf '%s %s\n' "$dep" "$mark"
+  done < <(dep_collect_recursive "$ref" | awk 'NF' | sort -u)
+}
+
+# Topological order for install/build
+declare -A _solv_vis=() _solv_done=()
+solver_emit() {
+  local pkg="$1"
+  [[ -n "${_solv_done[$pkg]:-}" ]] && return 0
+  [[ -n "${_solv_vis[$pkg]:-}" ]] && die "dependency cycle detected at: $pkg"
+  _solv_vis["$pkg"]=1
+  local portdir; portdir="$(resolve_portdir "$pkg")"
+  local tmp; tmp="$(mktemp)"; read_recipe "$portdir" >"$tmp"; parse_recipe_stream "$tmp"; rm -f "$tmp"
+  local dep ndep
+  for dep in "${R_MAKEDEPENDS[@]}" "${R_DEPENDS[@]}"; do
+    [[ -n "$dep" ]] || continue
+    ndep="$(normalize_dep "$dep")"
+    [[ -z "$ndep" ]] && continue
+    if resolve_portdir "$ndep" >/dev/null 2>&1; then solver_emit "$ndep"; fi
+  done
+  unset _solv_vis["$pkg"]
+  _solv_done["$pkg"]=1
+  echo "$pkg"
+}
+
+solver_plan() {
+  # Emit a topological plan (deps first, then target), with cycle detection.
+  _solv_vis=(); _solv_done=()
+  solver_emit "$1" | awk 'NF'
+}
+
+
+# ---------------- Source handling ----------------
+is_git_source() {
+  local s="$1"
+  [[ "$s" =~ ^git\+ || "$s" =~ ^git:// || "$s" =~ \.git($|[#@]) || "$s" =~ ^github: || "$s" =~ ^gitlab: ]] && return 0
+  return 1
+}
+
+parse_git_ref() {
+  # Supports: git+URL[@ref], URL#ref, github:org/repo[@ref|#ref], gitlab:group/proj[@ref|#ref]
+  local spec="$1" url ref=""
+  [[ "$spec" =~ ^git\+ ]] && spec="${spec#git+}"
+
+  if [[ "$spec" =~ ^github: ]]; then
+    local rest="${spec#github:}" orgrepo="$rest"
+    if [[ "$rest" == *"@"* ]]; then orgrepo="${rest%@*}"; ref="${rest#*@}"
+    elif [[ "$rest" == *"#"* ]]; then orgrepo="${rest%#*}"; ref="${rest#*#}"; fi
+    url="https://github.com/${orgrepo}.git"
+  elif [[ "$spec" =~ ^gitlab: ]]; then
+    local rest="${spec#gitlab:}" groupproj="$rest"
+    if [[ "$rest" == *"@"* ]]; then groupproj="${rest%@*}"; ref="${rest#*@}"
+    elif [[ "$rest" == *"#"* ]]; then groupproj="${rest%#*}"; ref="${rest#*#}"; fi
+    url="https://gitlab.com/${groupproj}.git"
+  else
+    url="$spec"
+    if [[ "$url" == *"@"* ]]; then
+      ref="${url##*@}"; url="${url%@*}"
+    elif [[ "$url" == *"#"* ]]; then
+      ref="${url##*#}"; url="${url%#*}"   # FIXED
+    fi
+  fi
+  echo "$url" "$ref"
+}
+
+fetch_http_ftp() {
+  local url="$1" out="$2"
+  [[ -f "$out" && $FORCE -eq 0 ]] && { vinfo "source cached: $(basename "$out")"; return 0; }
+  if command -v curl >/dev/null 2>&1; then run curl -L --fail --retry 3 -o "$out.tmp" "$url"
+  elif command -v wget >/dev/null 2>&1; then run wget -O "$out.tmp" "$url"
+  else die "need curl or wget"; fi
+  run mv -f "$out.tmp" "$out"
+}
+
+fetch_git() {
+  need_cmd git
+  local spec="$1" cachedir="$2"
+  local parsed; parsed="$(parse_git_ref "$spec")"
+  local url ref
+  url="$(awk '{print $1}' <<<"$parsed")"; ref="$(awk '{print $2}' <<<"$parsed")"
+  local base; base="$(basename "$url")"; [[ "$base" == *.git ]] || base="${base}.git"
+  local mirror="${cachedir}/${base}"
+  if [[ -d "$mirror" && $FORCE -eq 0 ]]; then
+    vinfo "git cached: $base (updating mirror)"
+    run git -C "$mirror" fetch --prune --tags || true
+  else
+    [[ -d "$mirror" && $FORCE -eq 1 ]] && run rm -rf "$mirror"
+    info "cloning mirror: $url"
+    run git clone --mirror "$url" "$mirror"
+  fi
+  if ((DRY_RUN)); then echo "+ echo \"$ref\" > \"$mirror/.pkg_ref\""
+  else printf '%s' "$ref" >"$mirror/.pkg_ref"; fi
+}
+
+verify_sha256() {
+  local file="$1" expected="$2"
+  [[ -z "$expected" ]] && return 0
+  need_cmd sha256sum
+  local got; got="$(sha256sum "$file" | awk '{print $1}')"
+  [[ "$got" == "$expected" ]] || die "sha256 mismatch for $(basename "$file")"
+}
+
+cmd_fetch() {
+  local portdir; portdir="$(resolve_portdir "$1")"
+  local tmp; tmp="$(mktemp)"; read_recipe "$portdir" >"$tmp"; parse_recipe_stream "$tmp"; rm -f "$tmp"
+  info "fetch: ${R_NAME} ${R_VERSION}-${R_RELEASE}"
+  mkd "$SOURCES_DIR/${R_NAME}"
+  local idx=0 spec
+  for spec in "${R_SOURCES[@]}"; do
+    [[ -z "$spec" ]] && continue
+    if is_git_source "$spec"; then
+      fetch_git "$spec" "$SOURCES_DIR/${R_NAME}"
+    else
+      local filename; filename="$(basename "${spec%%\?*}")"
+      local out="${SOURCES_DIR}/${R_NAME}/${filename}"
+      fetch_http_ftp "$spec" "$out"
+      [[ ${#R_SUMS[@]} -gt 0 ]] && { [[ $idx -lt ${#R_SUMS[@]} ]] || die "sha256sums count mismatch"; verify_sha256 "$out" "${R_SUMS[$idx]}"; }
+    fi
+    ((idx++))
+  done
+}
+
+# ---------------- Build deps installation ----------------
+declare -A _dep_visiting=() _dep_visited=()
+
+find_cached_pkg() {
+  local name="$1"
+  local f; f="$(ls -1 "${BIN_DIR}/${name}-"*.tar.gz 2>/dev/null | sort -V | tail -n 1 || true)"
+  [[ -n "$f" ]] || return 1
+  echo "$f"
+}
+
+install_dep_pkg() {
+  local name="$1"
+  if is_installed "$name"; then return 0; fi
+  if find_cached_pkg "$name" >/dev/null 2>&1; then
+    cmd_install "$name"
+  else
+    local portdir; portdir="$(resolve_portdir "$name")"
+    cmd_build "$portdir"
+    cmd_install "$name" --from "$portdir"
+  fi
+}
+
+install_deps_solved() {
+  local ref="$1" pkg
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    [[ "$pkg" == "$ref" ]] && continue
+    vinfo "solver: dep -> $pkg"
+    as_root_needed
+    install_dep_pkg "$pkg"
+  done < <(solver_plan "$ref")
+}
+
+# ---------------- Build & packaging ----------------
+portable_tar() { local srcdir="$1" out="$2"; run tar -C "$srcdir" -czf "$out" .; }
+
+unpack_source() {
+  local file="$1" dest="$2"
+  case "$file" in
+    *.tar.gz|*.tgz) run tar -C "$dest" -xzf "$file" ;;
+    *.tar.xz) run tar -C "$dest" -xJf "$file" ;;
+    *.tar.bz2|*.tbz2) run tar -C "$dest" -xjf "$file" ;;
+    *.tar.zst) need_cmd zstd; run tar -C "$dest" --use-compress-program=zstd -xf "$file" ;;
+    *.tar) run tar -C "$dest" -xf "$file" ;;
+    *.zip) need_cmd unzip; run unzip -q "$file" -d "$dest" ;;
+    *) run cp -f "$file" "$dest/" ;;
+  esac
+}
+
+checkout_git_mirror() {
+  need_cmd git
+  local mirror="$1" workdir="$2"
+  local ref=""; [[ -f "$mirror/.pkg_ref" ]] && ref="$(cat "$mirror/.pkg_ref" || true)"
+  local name; name="$(basename "$mirror" .git)"
+  local out="${workdir}/${name}"
+  [[ -d "$out" ]] && run rm -rf "$out"
+  run git clone "$mirror" "$out"
+  [[ -n "$ref" ]] && run git -C "$out" checkout --quiet "$ref"
+}
+
+apply_patches() {
+  local portdir="$1" workdir="$2" pdir="${portdir%/}/patches"
+  [[ -d "$pdir" ]] || return 0
+  need_cmd patch
+  shopt -s nullglob
+  local patches=("$pdir"/*.patch "$pdir"/*.diff)
+  shopt -u nullglob
+  [[ ${#patches[@]} -eq 0 ]] && return 0
+  info "applying patches from: $pdir"
+  local p
+  for p in "${patches[@]}"; do
+    info "  patch: $(basename "$p")"
+    if ((DRY_RUN)); then echo "+ (cd \"$workdir\" && patch -p1 < \"$p\")"
+    else (cd "$workdir" && patch -p1 <"$p"); fi
+  done
+}
+
+overlay_files() {
+  local portdir="$1" destdir="$2" fdir="${portdir%/}/files"
+  [[ -d "$fdir" ]] || return 0
+  info "overlay files: $fdir -> DESTDIR"
+  if ((DRY_RUN)); then echo "+ cp -a \"$fdir\"/. \"$destdir\"/"
+  else cp -a "$fdir"/. "$destdir"/; fi
+}
+
+run_build() {
+  local portdir="$1" workdir="$2" destdir="$3" buildlog="$4"
+  (
+    set -Eeuo pipefail
+    umask 022
+    export MAKEFLAGS="-j${JOBS}"
+    export DESTDIR="$destdir"
+    export PKGROOT="$PKGROOT"
+    cd "$workdir"
+    # shellcheck disable=SC1090
+    source "$portdir/Pkgfile"
+    declare -F build >/dev/null 2>&1 || die "Pkgfile missing build() in $portdir"
+    build
+  ) 2>&1 | tee -a "$buildlog"
+}
+
+
+cmd_build() {
+  local portdir; portdir="$(resolve_portdir "$1")"
+  local tmp; tmp="$(mktemp)"; read_recipe "$portdir" >"$tmp"; parse_recipe_stream "$tmp"; rm -f "$tmp"
+
+  # install deps using solver plan (topological)
+  install_deps_solved "$R_NAME"
+
+  local pkgid="${R_NAME}-${R_VERSION}-${R_RELEASE}"
+  local out_pkg="${BIN_DIR}/${pkgid}.tar.gz"
+  local out_meta="${BIN_DIR}/${pkgid}.meta"
+  local fp; fp="$(recipe_fingerprint "$portdir")"
+
+  if [[ -f "$out_pkg" && -f "$out_meta" && $REBUILD -eq 0 ]]; then
+    local fp_old; fp_old="$(awk -F= '$1=="fingerprint"{print $2}' "$out_meta" 2>/dev/null || true)"
+    if [[ -n "$fp_old" && "$fp_old" == "$fp" ]]; then
+      info "binary cache hit (fingerprint match): $(basename "$out_pkg")"
+      return 0
+    fi
+  fi
+
+  mkd "$SOURCES_DIR/${R_NAME}" "$BUILDS_DIR/${pkgid}"
+  local workbase="${BUILDS_DIR}/${pkgid}" workdir="${workbase}/work" destdir="${workbase}/dest"
+  local buildlog="${LOG_DIR}/${pkgid}.build.log"
+  if [[ -d "$workbase" && ( $FORCE -eq 1 || $REBUILD -eq 1 ) ]]; then run rm -rf "$workbase"; fi
+  mkd "$workdir" "$destdir"
+
+  : >"$buildlog"
+  info "build: $pkgid"
+  info "workdir: $workdir"
+  info "destdir: $destdir"
+
+  # Fetch sources (creates git mirrors and downloads archives)
+  cmd_fetch "$portdir"
+
+  # Materialize sources into workdir
+  local spec parsed url ref filename file_path
+  for spec in "${R_SOURCES[@]}"; do
+    [[ -n "$spec" ]] || continue
+    if is_git_source "$spec"; then
+      parsed="$(parse_git_ref "$spec")"
+      url="$(awk '{print $1}' <<<"$parsed")"
+      ref="$(awk '{print $2}' <<<"$parsed")"
+      # Mirror path as created by fetch_git()
+      local base; base="$(basename "$url")"; [[ "$base" == *.git ]] || base="${base}.git"
+      local mirror="${SOURCES_DIR}/${R_NAME}/${base}"
+      [[ -d "$mirror" ]] || die "missing git mirror (did fetch fail?): $mirror"
+      # Prefer explicit ref (including commit) if present in spec; otherwise use mirror's stored ref.
+      if [[ -n "$ref" ]]; then
+        printf '%s' "$ref" >"$mirror/.pkg_ref"
+      fi
+      checkout_git_mirror "$mirror" "$workdir"
+    else
+      filename="$(basename "${spec%%\?*}")"
+      file_path="${SOURCES_DIR}/${R_NAME}/${filename}"
+      [[ -f "$file_path" ]] || die "missing source file (did fetch fail?): $file_path"
+      unpack_source "$file_path" "$workdir"
+    fi
+  done
+
+  apply_patches "$portdir" "$workdir"
+  run_build "$portdir" "$workdir" "$destdir" "$buildlog"
+  overlay_files "$portdir" "$destdir"
+
+  if ((DRY_RUN==0)); then
+    mkd "$BIN_DIR"
+    cat >"$out_meta" <<EOF
+name=${R_NAME}
+version=${R_VERSION}
+release=${R_RELEASE}
+built_at=$(date -u +"%Y-%m-%dT%H%M%SZ")
+port_path=${portdir}
+fingerprint=${fp}
+EOF
+  fi
+
+  mkd "$BIN_DIR"
+  portable_tar "$destdir" "$out_pkg"
+  tar_validate_tarball "$out_pkg"
+
+  if ((KEEP_WORK==0)); then run rm -rf "$workbase"; fi
+  info "built: $pkgid"
+}
+
+
+
+# ---------------- Hooks ----------------
+run_hook_if_defined() {
+  local portdir="$1" hook="$2"
+  [[ -f "$portdir/Pkgfile" ]] || return 0
+  if ((DRY_RUN)); then echo "+ (source \"$portdir/Pkgfile\" && $hook)"; return 0; fi
+  (
+    set -Eeuo pipefail
+    export PKGROOT="$PKGROOT"
+    # shellcheck disable=SC1090
+    source "$portdir/Pkgfile"
+    declare -F "$hook" >/dev/null && "$hook" || true
+  )
+}
+
+# ---------------- Install / transactional apply ----------------
+record_files_and_hashes() {
+  local name="$1" tarball="$2" dbdir="$3"
+  need_cmd sha256sum
+  if ((DRY_RUN)); then
+    echo "+ tar -tzf \"$tarball\" > \"$dbdir/files\""
+    echo "+ sha256 for installed files -> \"$dbdir/hashes\""
+    return 0
+  fi
+  tar -tzf "$tarball" | sed 's#^\./##' >"$dbdir/files"
+  : >"$dbdir/hashes"
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    rel="${rel#./}"
+    [[ "$rel" == */ ]] && continue
+    local p="${PKGROOT%/}/$rel"
+    [[ -f "$p" && ! -L "$p" ]] && sha256sum "$p" >>"$dbdir/hashes" || true
+  done <"$dbdir/files"
+}
+
+hash_lookup_expected() { awk -v p="$2" '$2==p{print $1; exit 0}' "$1" 2>/dev/null || true; }
+
+remove_obsolete_files() {
+  # remove files in old but not in new list. Skip directories; preserve modified unless --force-remove.
+  local old_db="$1" new_list_file="$2"
+  local old_files="$old_db/files" hashes="$old_db/hashes"
+  [[ -f "$old_files" ]] || return 0
+  local newtmp; newtmp="$(mktemp)"
+  if ((DRY_RUN)); then
+    echo "+ compute obsolete file set and remove"
+    rm -f "$newtmp" || true
+    return 0
+  fi
+  sort -u "$new_list_file" >"$newtmp"
+  local rel
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    rel="${rel#./}"
+    [[ "$rel" == */ ]] && continue
+    grep -qxF "$rel" "$newtmp" && continue
+    local p="${PKGROOT%/}/$rel"
+    [[ -d "$p" ]] && continue
+    if [[ -f "$p" && ! -L "$p" && -f "$hashes" && $FORCE_REMOVE -eq 0 ]]; then
+      local exp; exp="$(hash_lookup_expected "$hashes" "$p")"
+      if [[ -n "$exp" ]]; then
+        local got; got="$(sha256sum "$p" | awk '{print $1}' || true)"
+        if [[ -n "$got" && "$got" != "$exp" ]]; then
+          warn "preserving modified obsolete file: $p (use --force-remove to delete)"
+          continue
+        fi
+      fi
+    fi
+    [[ -e "$p" || -L "$p" ]] && rm -f "$p" || true
+  done < <(awk 'NF' "$old_files")
+  rm -f "$newtmp"
+}
+
+tar_extract_preserve() {
+  # Extract tarball into destination with best-effort preservation of perms/mtime/ownership.
+  local tarball="$1" dest="$2"
+  mkd "$dest"
+  local opts=()
+  # -p preserves permissions, -m would ignore mtime, so do NOT use -m
+  opts+=(-xpf "$tarball" -C "$dest")
+  # ownership: only meaningful as root; try --same-owner and numeric owners if supported
+  if [[ "$(id -u)" -eq 0 ]]; then
+    tar --help 2>/dev/null | grep -q -- '--same-owner' && opts+=(--same-owner)
+    tar --help 2>/dev/null | grep -q -- '--numeric-owner' && opts+=(--numeric-owner)
+  fi
+  run tar "${opts[@]}"
+}
+
+tar_validate_tarball() {
+  # Validates tarball paths and entry types before extraction.
+  # Allows only: regular files, directories, symlinks. Rejects device nodes, fifos, sockets, etc.
+  local tarball="$1"
+  local -a bad=()
+  local line type path
+
+  # Use verbose listing to infer type from first char of mode string.
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    # GNU tar verbose format: <mode> <user>/<group> <size> <date> <time> <path>
+    type="${line:0:1}"
+    path="${line##* }"
+    path="${path#./}"
+
+    # Skip pax headers if present (best-effort); they are metadata-only.
+    if [[ "$path" == "././@PaxHeader" || "$path" == "@PaxHeader" || "$path" == *"/@PaxHeader" ]]; then
+      continue
+    fi
+
+    # Path safety
+    if [[ "$path" == /* || "$path" == *$'\0'* || "$path" == "" ]]; then
+      bad+=("unsafe path: '$path'")
+      continue
+    fi
+    if [[ "$path" == "." || "$path" == ".." || "$path" == *"/../"* || "$path" == "../"* || "$path" == *"/.." ]]; then
+      bad+=("path traversal: '$path'")
+      continue
+    fi
+
+    # Type safety
+    case "$type" in
+      -|d|l) : ;;
+      *) bad+=("unsupported entry type '$type' for '$path'") ;;
+    esac
+  done < <(tar -tvzf "$tarball" 2>/dev/null || tar -tvf "$tarball" 2>/dev/null || true)
+
+  if ((${#bad[@]})); then
+    printf '%s\n' "${bad[@]}" >&2
+    die "tarball validation failed: $tarball"
+  fi
+}
+
+
+transactional_apply_tarball() {
+  # Stronger transactional apply:
+  # - Extract to staging/root preserving metadata
+  # - Preflight conflicts (unless --force)
+  # - Backup overwritten paths
+  # - Rename from staging to root (atomic where possible)
+  # - Remove obsolete from previous version
+  local pkgname="$1" tarball="$2" portdir="$3" old_db="${4:-}"
+  need_cmd tar
+
+  tar_validate_tarball "$tarball"
+
+  check_conflicts_tarball "$pkgname" "$tarball"
+
+  local pkgid; pkgid="$(basename "$tarball" .tar.gz)"
+  local stage="${STAGING_DIR}/${pkgid}"
+  local root_stage="${stage}/root"
+  local backup="${stage}/backup"
+  local newlist="${stage}/new.files"
+
+  info "transaction: staging to $root_stage"
+  if ((DRY_RUN)); then
+    echo "+ rm -rf \"$stage\"; mkdir -p \"$root_stage\" \"$backup\""
+    echo "+ extract tar preserving metadata"
+    echo "+ tar -tzf \"$tarball\" > \"$newlist\""
+  else
+    rm -rf "$stage" || true
+    mkdir -p "$root_stage" "$backup"
+    tar_extract_preserve "$tarball" "$root_stage"
+    tar -tzf "$tarball" | sed 's#^\./##' >"$newlist"
+  fi
+
+  # Hooks
+  [[ -n "$portdir" ]] && run_hook_if_defined "$portdir" pre_upgrade || true
+
+  # Backup & apply
+  info "transaction: swapping files"
+  if ((DRY_RUN)); then
+    echo "+ create dirs; backup overwritten; rename staged into place"
+    return 0
+  fi
+
+  # create directories first (so device nodes/symlinks in dirs can land)
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    mkdir -p "${PKGROOT%/}/$d" || true
+  done < <(cd "$root_stage" && find . -type d | sed 's#^\./##' | awk 'NF' | sort)
+
+  # backup existing targets and then rename into place
+  local rel src dst
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    rel="${rel#./}"
+    [[ "$rel" == */ ]] && continue
+    src="${root_stage%/}/$rel"
+    dst="${PKGROOT%/}/$rel"
+    # skip dirs (handled)
+    [[ -d "$src" ]] && continue
+
+    mkdir -p "$(dirname "$dst")" || true
+    if [[ -e "$dst" || -L "$dst" ]]; then
+      mkdir -p "$(dirname "${backup}/$rel")" || true
+      mv "$dst" "${backup}/$rel" 2>/dev/null || true
+    fi
+
+    # Prefer atomic rename; if cross-device, fallback to cp -a then rm
+    if ! mv "$src" "$dst" 2>/dev/null; then
+      # fallback
+      if [[ -L "$src" ]]; then
+        # recreate symlink
+        local tgt; tgt="$(readlink "$src")"
+        rm -f "$dst" 2>/dev/null || true
+        ln -s "$tgt" "$dst"
+        rm -f "$src" 2>/dev/null || true
+      else
+        cp -a "$src" "$dst"
+        rm -f "$src" 2>/dev/null || true
+      fi
+    fi
+  done <"$newlist"
+
+  # remove obsolete from previous version
+  if [[ -n "$old_db" && -d "$old_db" ]]; then
+    info "transaction: removing obsolete files from previous version"
+    remove_obsolete_files "$old_db" "$newlist"
+  fi
+
+  # cleanup staging
+  rm -rf "$stage" 2>/dev/null || true
+
+  [[ -n "$portdir" ]] && run_hook_if_defined "$portdir" post_upgrade || true
+}
+
+cmd_install() {
+  local name="$1"; shift || true
+  local from_ref=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --from) from_ref="$2"; shift 2 ;; *) die "unknown install option: $1" ;; esac
+  done
+
+  local tarball
+  if tarball="$(find_cached_pkg "$name")"; then :; else
+    [[ -n "$from_ref" ]] || die "no cached binary for '$name' (use --from)"
+    cmd_build "$from_ref"
+    tarball="$(find_cached_pkg "$name")" || die "no cached binary after build for '$name'"
+  fi
+
+  as_root_needed
+  local dbdir="${INSTALLED_DIR}/${name}"
+  [[ -d "$dbdir" && $FORCE -eq 0 ]] && die "already installed: $name"
+
+  local portdir=""
+  [[ -n "$from_ref" ]] && portdir="$(resolve_portdir "$from_ref")"
+
+  # transactional apply even for install (old_db empty)
+  transactional_apply_tarball "$name" "$tarball" "$portdir" ""
+
+  info "install(db): recording meta + files/hashes"
+  mkd "$dbdir"
+  if ((DRY_RUN)); then
+    echo "+ write meta and files/hashes to $dbdir"
+  else
+    local pkgid; pkgid="$(basename "$tarball" .tar.gz)"
+    awk '1' "${BIN_DIR}/${pkgid}.meta" >"$dbdir/meta"
+  fi
+  record_files_and_hashes "$name" "$tarball" "$dbdir"
+
+  [[ -n "$portdir" ]] && run_hook_if_defined "$portdir" pre_install || true
+  [[ -n "$portdir" ]] && run_hook_if_defined "$portdir" post_install || true
+
+  rebuild_owners
+  info "installed: $name"
+}
+
+cmd_remove() {
+  local name="$1"
+  as_root_needed
+  local dbdir="${INSTALLED_DIR}/${name}"
+  [[ -d "$dbdir" ]] || die "not installed: $name"
+  [[ -f "$dbdir/files" ]] || die "missing file list for $name"
+  local hashes="${dbdir}/hashes"
+  [[ -f "$hashes" ]] || warn "missing hashes for $name (will remove as listed)"
+  info "remove: $name"
+
+  local portdir=""
+  local pp; pp="$(awk -F= '$1=="port_path"{print $2}' "$dbdir/meta" 2>/dev/null || true)"
+  [[ -n "$pp" && -f "$pp/Pkgfile" ]] && portdir="$pp"
+  [[ -n "$portdir" ]] && run_hook_if_defined "$portdir" pre_remove || true
+
+  local files; files="$(awk 'NF' "$dbdir/files" | sort -r)"
+  local preserved=0 removed=0 rel
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    rel="${rel#./}"
+    [[ "$rel" == */ ]] && continue
+    local p="${PKGROOT%/}/$rel"
+    if [[ -f "$p" && ! -L "$p" && -f "$hashes" && $FORCE_REMOVE -eq 0 ]]; then
+      local exp; exp="$(hash_lookup_expected "$hashes" "$p")"
+      if [[ -n "$exp" ]]; then
+        local got; got="$(sha256sum "$p" | awk '{print $1}' || true)"
+        if [[ -n "$got" && "$got" != "$exp" ]]; then
+          warn "preserving modified file: $p (use --force-remove to delete)"
+          preserved=$((preserved+1))
+          continue
+        fi
+      fi
+    fi
+    if [[ -e "$p" || -L "$p" ]]; then run rm -f "$p" || true; removed=$((removed+1)); fi
+  done <<<"$files"
+
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    rel="${rel#./}"
+    local d="${rel%/*}"; [[ "$d" == "$rel" ]] && continue
+    local pd="${PKGROOT%/}/$d"
+    [[ -d "$pd" ]] && run rmdir -p --ignore-fail-on-non-empty "$pd" 2>/dev/null || true
+  done <<<"$files"
+
+  run rm -rf "$dbdir"
+  rebuild_owners
+  [[ -n "$portdir" ]] && run_hook_if_defined "$portdir" post_remove || true
+  info "removed: $name (files removed: $removed, preserved: $preserved)"
+}
+
+cmd_list() { ls -1 "$INSTALLED_DIR" 2>/dev/null | sort || true; }
+
+cmd_info() {
+  local name="$1" dbdir="${INSTALLED_DIR}/${name}"
+  [[ -d "$dbdir" ]] || die "not installed: $name"
+  echo "Name: $name"
+  [[ -f "$dbdir/meta" ]] && sed 's/^/  /' "$dbdir/meta"
+  [[ -f "$dbdir/files" ]] && echo "Files: $(wc -l <"$dbdir/files" | tr -d ' ')"
+}
+
+cmd_clean_pkg() {
+  local name="$1"
+  run rm -rf "${BUILDS_DIR}/${name}-"* 2>/dev/null || true
+  run rm -f "${BIN_DIR}/${name}-"*.tar.gz "${BIN_DIR}/${name}-"*.meta 2>/dev/null || true
+  run rm -rf "${SOURCES_DIR:?}/${name}" 2>/dev/null || true
+  info "cleaned caches for: $name"
+}
+
+cmd_clean_all() {
+  info "clean --all: removing ALL caches and logs (does NOT uninstall)"
+  run rm -rf "${BUILDS_DIR:?}/"* 2>/dev/null || true
+  run rm -rf "${SOURCES_DIR:?}/"* 2>/dev/null || true
+  run rm -rf "${BIN_DIR:?}/"* 2>/dev/null || true
+  run rm -rf "${LOG_DIR:?}/"* 2>/dev/null || true
+  run rm -rf "${STAGING_DIR:?}/"* 2>/dev/null || true
+  run rm -f "${INDEX_FILE}" "${OWNERS_FILE}" 2>/dev/null || true
+  info "done"
+}
+
+cmd_gc() {
+  info "gc: removing temp files and empty dirs"
+  run find "$SOURCES_DIR" -type f -name '*.tmp' -delete 2>/dev/null || true
+  run find "$BUILDS_DIR" -mindepth 1 -maxdepth 1 -type d -empty -delete 2>/dev/null || true
+  info "gc done"
+}
+
+# ---------------- Upgrade ----------------
+version_release_str() { echo "${1}-${2}"; }
+
+cmd_upgrade_one() {
+  local name="$1"
+  is_installed "$name" || { warn "not installed: $name"; return 0; }
+  local portdir; portdir="$(resolve_portdir "$name")"
+  local tmp; tmp="$(mktemp)"; read_recipe "$portdir" >"$tmp"; parse_recipe_stream "$tmp"; rm -f "$tmp"
+  local inst; inst="$(installed_version_release "$name" || echo "")"
+  local target; target="$(version_release_str "$R_VERSION" "$R_RELEASE")"
+  [[ -n "$inst" && "$inst" == "$target" ]] && { info "upgrade: $name is up-to-date (${inst})"; return 0; }
+
+  info "upgrade: $name ${inst:-unknown} -> $target"
+  cmd_build "$portdir"
+
+  local tarball; tarball="$(find_cached_pkg "$name")" || die "no cached binary for '$name' after build"
+  local olddb="${INSTALLED_DIR}/${name}"
+
+  transactional_apply_tarball "$name" "$tarball" "$portdir" "$olddb"
+
+  # update db meta/hashes
+  local dbdir="${INSTALLED_DIR}/${name}"
+  mkd "$dbdir"
+  if ((DRY_RUN)); then echo "+ update db meta/hashes for $name"
+  else
+    local pkgid; pkgid="$(basename "$tarball" .tar.gz)"
+    awk '1' "${BIN_DIR}/${pkgid}.meta" >"$dbdir/meta"
+  fi
+  record_files_and_hashes "$name" "$tarball" "$dbdir"
+  rebuild_owners
+  info "upgraded: $name"
+}
+
+cmd_upgrade() {
+  local which="${1:-all}"
+  if [[ "$which" == "all" ]]; then
+    local n
+    while IFS= read -r n; do [[ -n "$n" ]] && cmd_upgrade_one "$n"; done < <(cmd_list)
+  else
+    cmd_upgrade_one "$which"
+  fi
+}
+
+init_layout
+start_logging
+
+if needs_lock "${cmd:-}"; then
+  lock_acquire
+  trap lock_release EXIT
+fi
+
+case "${cmd:-}" in
+  repo)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      list) [[ $# -eq 0 ]] || die "usage: pkg repo list"; repo_list ;;
+      add) [[ $# -ge 3 ]] || die "usage: pkg repo add <name> git <url> [ref] | rsync <src>"; repo_add "$@" ;;
+      remove) [[ $# -eq 1 ]] || die "usage: pkg repo remove <name>"; repo_remove "$1" ;;
+      update)
+        if [[ $# -eq 0 ]]; then repo_update "all"
+        elif [[ $# -eq 1 ]]; then repo_update "$1"
+        else die "usage: pkg repo update [name|all]"; fi
+        ;;
+      *) die "usage: pkg repo <list|add|remove|update>" ;;
+    esac
+    ;;
+  cache) [[ $# -eq 0 ]] || die "usage: pkg cache"; rebuild_cache ;;
+  repo-list) [[ $# -eq 0 ]] || die "usage: pkg repo-list"; cmd_repo_list_ports ;;
+  search) [[ $# -eq 1 ]] || die "usage: pkg search <term>"; cmd_search "$1" ;;
+  path) [[ $# -eq 1 ]] || die "usage: pkg path <pkg>"; cmd_path "$1" ;;
+  quickdep) [[ $# -eq 1 ]] || die "usage: pkg quickdep <pkg|portdir>"; cmd_quickdep "$1" ;;
+  depends) [[ $# -eq 1 ]] || die "usage: pkg depends <pkg|portdir>"; cmd_depends "$1" ;;
+  fetch) [[ $# -eq 1 ]] || die "usage: pkg fetch <pkg|portdir>"; cmd_fetch "$1" ;;
+  build) [[ $# -eq 1 ]] || die "usage: pkg build <pkg|portdir>"; cmd_build "$1" ;;
+  install) [[ $# -ge 1 ]] || die "usage: pkg install <name> [--from <pkg|portdir>]"; cmd_install "$@" ;;
+  remove) [[ $# -eq 1 ]] || die "usage: pkg remove <name>"; cmd_remove "$1" ;;
+  upgrade) [[ $# -eq 1 ]] || die "usage: pkg upgrade <name|all>"; cmd_upgrade "$1" ;;
+  list) [[ $# -eq 0 ]] || die "usage: pkg list"; cmd_list ;;
+  info) [[ $# -eq 1 ]] || die "usage: pkg info <name>"; cmd_info "$1" ;;
+  clean)
+    if [[ $# -eq 1 && "$1" == "--all" ]]; then cmd_clean_all
+    elif [[ $# -eq 1 ]]; then cmd_clean_pkg "$1"
+    else die "usage: pkg clean <name> | pkg clean --all"; fi
+    ;;
+  gc) [[ $# -eq 0 ]] || die "usage: pkg gc"; cmd_gc ;;
+  ""|-h|--help) usage ;;
+  *) die "unknown command: ${cmd:-} (try --help)" ;;
+esac
